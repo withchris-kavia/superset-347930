@@ -26,6 +26,7 @@ import {
   convertKeysToCamelCase,
   isDefined,
   isRequired,
+  maskEmail,
   makeSingleton,
 } from '@superset-ui/core';
 
@@ -40,6 +41,7 @@ describe('index', () => {
       convertKeysToCamelCase,
       isDefined,
       isRequired,
+      maskEmail,
       makeSingleton,
     ].forEach(x => expect(x).toBeDefined());
   });
