@@ -29,7 +29,12 @@ from typing import Any
 import pandas as pd
 from fastmcp import Context
 from superset_core.mcp.decorators import ToolAnnotations, tool
-from superset_core.queries.types import CacheOptions, QueryOptions, QueryResult, QueryStatus
+from superset_core.queries.types import (
+    CacheOptions,
+    QueryOptions,
+    QueryResult,
+    QueryStatus,
+)
 
 from superset.errors import SupersetErrorType
 from superset.exceptions import OAuth2Error, OAuth2RedirectError
@@ -73,7 +78,7 @@ async def _fetch_database_and_validate_access(
     ctx: Context,
     *,
     db: Any,
-    Database: Any,
+    database_model: Any,
     security_manager: Any,
 ) -> tuple[Any | None, ExecuteSqlResponse | None]:
     """
@@ -82,7 +87,9 @@ async def _fetch_database_and_validate_access(
     Returns (database, error_response). Exactly one of the tuple items will be non-None.
     """
     with event_logger.log_context(action="mcp.execute_sql.db_validation"):
-        database = db.session.query(Database).filter_by(id=request.database_id).first()
+        database = (
+            db.session.query(database_model).filter_by(id=request.database_id).first()
+        )
         if not database:
             await ctx.warning("Database not found: database_id=%s" % request.database_id)
             return None, ExecuteSqlResponse(
@@ -127,7 +134,10 @@ async def _precheck_destructive_ddl(
                 from superset.jinja_context import get_template_processor
 
                 tp = get_template_processor(database=database)
-                sql_to_check = tp.process_template(request.sql, **request.template_params)
+                sql_to_check = tp.process_template(
+                    request.sql,
+                    **request.template_params,
+                )
 
             script = SQLScript(sql_to_check, database.db_engine_spec.engine)
             if script.has_destructive():
@@ -170,7 +180,11 @@ def _build_query_options(request: ExecuteSqlRequest) -> QueryOptions:
     )
 
 
-def _execute_query(database: Any, request: ExecuteSqlRequest, options: QueryOptions) -> QueryResult:
+def _execute_query(
+    database: Any,
+    request: ExecuteSqlRequest,
+    options: QueryOptions,
+) -> QueryResult:
     with event_logger.log_context(action="mcp.execute_sql.query_execution"):
         return database.execute(request.sql, options)
 
@@ -192,7 +206,9 @@ async def _maybe_add_template_warning(
             "Template variables in the SQL were NOT substituted; "
             "the query was executed with literal '{{ var }}' placeholders."
         )
-        await ctx.warning("template_params supplied but ENABLE_TEMPLATE_PROCESSING is off")
+        await ctx.warning(
+            "template_params supplied but ENABLE_TEMPLATE_PROCESSING is off"
+        )
 
 
 async def _log_finish(response: ExecuteSqlResponse, ctx: Context) -> None:
@@ -232,7 +248,7 @@ async def execute_sql(request: ExecuteSqlRequest, ctx: Context) -> ExecuteSqlRes
             request,
             ctx,
             db=db,
-            Database=Database,
+            database_model=Database,
             security_manager=security_manager,
         )
         if error_response is not None:
@@ -260,7 +276,8 @@ async def execute_sql(request: ExecuteSqlRequest, ctx: Context) -> ExecuteSqlRes
 
     except OAuth2RedirectError as ex:
         await ctx.warning(
-            "Database requires OAuth authentication: database_id=%s" % request.database_id
+            "Database requires OAuth authentication: database_id=%s"
+            % request.database_id
         )
         return ExecuteSqlResponse(
             success=False,
@@ -268,7 +285,9 @@ async def execute_sql(request: ExecuteSqlRequest, ctx: Context) -> ExecuteSqlRes
             error_type=SupersetErrorType.OAUTH2_REDIRECT.value,
         )
     except OAuth2Error:
-        await ctx.error("OAuth2 configuration/flow error: database_id=%s" % request.database_id)
+        await ctx.error(
+            "OAuth2 configuration/flow error: database_id=%s" % request.database_id
+        )
         return ExecuteSqlResponse(
             success=False,
             error=OAUTH2_CONFIG_ERROR_MESSAGE,
@@ -276,7 +295,8 @@ async def execute_sql(request: ExecuteSqlRequest, ctx: Context) -> ExecuteSqlRes
         )
     except Exception as e:
         await ctx.error(
-            "SQL execution failed: error=%s, database_id=%s" % (str(e), request.database_id)
+            "SQL execution failed: error=%s, database_id=%s"
+            % (str(e), request.database_id)
         )
         raise
 
@@ -316,7 +336,9 @@ def _data_to_statement_data(data: Any) -> StatementData:
         _sanitize_row_values(rows_data)
         return StatementData(
             rows=rows_data,
-            columns=[ColumnInfo(name=col, type=str(data[col].dtype)) for col in data.columns],
+            columns=[
+                ColumnInfo(name=col, type=str(data[col].dtype)) for col in data.columns
+            ],
         )
     elif isinstance(data, bytes):
         try:

@@ -62,6 +62,46 @@ def _seed_standard_test_users() -> None:
 
     sm = security_manager
 
+    def _reset_users_for_deterministic_ids() -> None:
+        """
+        Reset FAB users so canonical integration-test users get stable IDs.
+
+        Some integration tests assert hard-coded IDs (e.g. gamma=2, alpha=5).
+        When a metadata DB is reused, IDs can drift. We reset the user tables
+        (and restart identity where possible) to restore deterministic IDs.
+        """
+        from sqlalchemy import text
+
+        dialect = db.engine.dialect.name
+        if dialect == "postgresql":
+            db.session.execute(
+                text(
+                    "TRUNCATE TABLE ab_user_role, ab_user RESTART IDENTITY CASCADE"
+                )
+            )
+        else:
+            db.session.execute(text("DELETE FROM ab_user_role"))
+            db.session.execute(text("DELETE FROM ab_user"))
+            if dialect == "sqlite":
+                db.session.execute(
+                    text("DELETE FROM sqlite_sequence WHERE name='ab_user'")
+                )
+        db.session.commit()
+
+    # If DB is reused, ensure expected IDs for core users:
+    # admin=1, gamma=2, alpha=5.
+    user_count = db.session.query(sm.user_model).count()
+    if user_count:
+        existing = {
+            u.username: u.id
+            for u in db.session.query(sm.user_model)
+            .filter(sm.user_model.username.in_(["admin", "gamma", "alpha"]))
+            .all()
+        }
+        expected = {"admin": 1, "gamma": 2, "alpha": 5}
+        if any(existing.get(name) not in (None, exp) for name, exp in expected.items()):
+            _reset_users_for_deterministic_ids()
+
     # Ensure the example DB exists; the CLI seeding logic attaches database
     # access permissions to roles using the example DB perm string.
     examples_db = get_example_database()
