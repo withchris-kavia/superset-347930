@@ -22,12 +22,12 @@ Tool for executing SQL queries against databases using the unified
 Database.execute() API with RLS, template rendering, and security validation.
 """
 
-import logging
 from decimal import Decimal
+import logging
 from typing import Any
 
-import pandas as pd
 from fastmcp import Context
+import pandas as pd
 
 from superset_core.mcp.decorators import ToolAnnotations, tool
 from superset_core.queries.types import (
