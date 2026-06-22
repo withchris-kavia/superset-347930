@@ -17,7 +17,13 @@
  * under the License.
  */
 import rison from 'rison';
-import { useState, useEffect, useCallback, useRef } from 'react';
+import {
+  useState,
+  useEffect,
+  useCallback,
+  useRef,
+  type MutableRefObject,
+} from 'react';
 import { t } from '@apache-superset/core/translation';
 import {
   makeApi,
@@ -77,6 +83,87 @@ const parsedErrorMessage = (
     .join('\n');
 };
 
+type RequestLifecycleToken = {
+  requestId: number;
+  abortController: AbortController | null;
+  signal?: AbortSignal;
+};
+
+const createAbortController = () =>
+  typeof AbortController === 'undefined' ? null : new AbortController();
+
+function useMountedRef() {
+  const mountedRef = useRef(true);
+
+  useEffect(
+    () => () => {
+      mountedRef.current = false;
+    },
+    [],
+  );
+
+  return mountedRef;
+}
+
+function useLatestRequestLifecycle(
+  mountedRef: MutableRefObject<boolean>,
+): {
+  beginRequest: () => RequestLifecycleToken;
+  isCurrentRequest: (token: RequestLifecycleToken) => boolean;
+  finishRequest: (token: RequestLifecycleToken) => void;
+} {
+  const nextRequestIdRef = useRef(0);
+  const activeRequestIdRef = useRef(0);
+  const activeAbortControllerRef = useRef<AbortController | null>(null);
+
+  const beginRequest = useCallback(() => {
+    activeAbortControllerRef.current?.abort();
+
+    const abortController = createAbortController();
+    const requestId = nextRequestIdRef.current + 1;
+    nextRequestIdRef.current = requestId;
+    activeRequestIdRef.current = requestId;
+    activeAbortControllerRef.current = abortController;
+
+    return {
+      requestId,
+      abortController,
+      signal: abortController?.signal,
+    };
+  }, []);
+
+  const isCurrentRequest = useCallback(
+    (token: RequestLifecycleToken) =>
+      mountedRef.current &&
+      activeRequestIdRef.current === token.requestId &&
+      !token.abortController?.signal.aborted,
+    [mountedRef],
+  );
+
+  const finishRequest = useCallback((token: RequestLifecycleToken) => {
+    if (
+      activeRequestIdRef.current === token.requestId &&
+      activeAbortControllerRef.current === token.abortController
+    ) {
+      activeAbortControllerRef.current = null;
+    }
+  }, []);
+
+  useEffect(
+    () => () => {
+      activeAbortControllerRef.current?.abort();
+    },
+    [],
+  );
+
+  return {
+    beginRequest,
+    isCurrentRequest,
+    finishRequest,
+  };
+}
+
+// PUBLIC_INTERFACE
 export function useListViewResource<D extends object = any>(
   resource: string,
   resourceLabel: string, // resourceLabel for translations
@@ -87,6 +174,10 @@ export function useListViewResource<D extends object = any>(
   initialLoadingState = true,
   selectColumns?: string[],
 ) {
+  /**
+   * Loads paginated CRUD list resources while preventing stale or unmounted
+   * requests from mutating local ListView state.
+   */
   const [state, setState] = useState<ListViewResourceState<D>>({
     count: 0,
     collection: defaultCollectionValue,
@@ -96,11 +187,25 @@ export function useListViewResource<D extends object = any>(
     bulkSelectEnabled: false,
   });
 
+  const mountedRef = useMountedRef();
+  const {
+    beginRequest: beginInfoRequest,
+    isCurrentRequest: isCurrentInfoRequest,
+    finishRequest: finishInfoRequest,
+  } = useLatestRequestLifecycle(mountedRef);
+  const {
+    beginRequest: beginListRequest,
+    isCurrentRequest: isCurrentListRequest,
+    finishRequest: finishListRequest,
+  } = useLatestRequestLifecycle(mountedRef);
+
   const updateState = useCallback(
     (update: Partial<ListViewResourceState<D>>) => {
-      setState(currentState => ({ ...currentState, ...update }));
+      if (mountedRef.current) {
+        setState(currentState => ({ ...currentState, ...update }));
+      }
     },
-    [],
+    [mountedRef],
   );
 
   function toggleBulkSelect() {
@@ -114,27 +219,49 @@ export function useListViewResource<D extends object = any>(
 
   useEffect(() => {
     if (!infoEnable) return;
+    const request = beginInfoRequest();
+
     SupersetClient.get({
       endpoint: `/api/v1/${resource}/_info?q=${rison.encode({
         keys: ['permissions'],
       })}`,
-    }).then(
-      ({ json: infoJson = {} }) => {
-        updateState({
-          permissions: infoJson.permissions,
-        });
-      },
-      createErrorHandler(errMsg =>
-        handleErrorMsgRef.current(
-          t(
-            'An error occurred while fetching %s info: %s',
-            resourceLabel,
-            errMsg,
-          ),
-        ),
-      ),
-    );
-  }, [infoEnable, resource, resourceLabel, updateState]);
+      signal: request.signal,
+    })
+      .then(
+        ({ json: infoJson = {} }) => {
+          if (isCurrentInfoRequest(request)) {
+            updateState({
+              permissions: infoJson.permissions,
+            });
+          }
+        },
+        error => {
+          if (!isCurrentInfoRequest(request)) {
+            return undefined;
+          }
+          return createErrorHandler(errMsg =>
+            handleErrorMsgRef.current(
+              t(
+                'An error occurred while fetching %s info: %s',
+                resourceLabel,
+                errMsg,
+              ),
+            ),
+          )(error);
+        },
+      )
+      .finally(() => {
+        finishInfoRequest(request);
+      });
+  }, [
+    beginInfoRequest,
+    finishInfoRequest,
+    infoEnable,
+    isCurrentInfoRequest,
+    resource,
+    resourceLabel,
+    updateState,
+  ]);
 
   const hasPerm = useCallback(
     (perm: string) => {
@@ -156,6 +283,7 @@ export function useListViewResource<D extends object = any>(
       sortBy,
       filters: filterValues,
     }: FetchDataConfig) => {
+      const request = beginListRequest();
       const config: FetchDataConfig = {
         filters: filterValues,
         pageIndex,
@@ -193,32 +321,45 @@ export function useListViewResource<D extends object = any>(
 
       return SupersetClient.get({
         endpoint: `/api/v1/${resource}/?q=${queryParams}`,
+        signal: request.signal,
       })
         .then(
           ({ json = {} }) => {
-            updateState({
-              collection: json.result,
-              count: json.count,
-              lastFetched: new Date().toISOString(),
-            });
+            if (isCurrentListRequest(request)) {
+              updateState({
+                collection: json.result,
+                count: json.count,
+                lastFetched: new Date().toISOString(),
+              });
+            }
           },
-          createErrorHandler(errMsg =>
-            handleErrorMsg(
-              t(
-                'An error occurred while fetching %ss: %s',
-                resourceLabel,
-                errMsg,
+          error => {
+            if (!isCurrentListRequest(request)) {
+              return undefined;
+            }
+            return createErrorHandler(errMsg =>
+              handleErrorMsgRef.current(
+                t(
+                  'An error occurred while fetching %ss: %s',
+                  resourceLabel,
+                  errMsg,
+                ),
               ),
-            ),
-          ),
+            )(error);
+          },
         )
         .finally(() => {
-          updateState({ loading: false });
+          if (isCurrentListRequest(request)) {
+            updateState({ loading: false });
+          }
+          finishListRequest(request);
         });
     },
     [
       baseFilters,
-      handleErrorMsg,
+      beginListRequest,
+      finishListRequest,
+      isCurrentListRequest,
       resource,
       resourceLabel,
       selectColumns,
@@ -265,27 +406,39 @@ interface SingleViewResourceState<D extends object = any> {
   error: any | null;
 }
 
+// PUBLIC_INTERFACE
 export function useSingleViewResource<D extends object = any>(
   resourceName: string,
   resourceLabel: string, // resourceLabel for translations
   handleErrorMsg: (errorMsg: string) => void,
   pathSuffix = '',
 ) {
+  /**
+   * Loads and mutates an individual CRUD resource while ensuring only the
+   * latest request may update the hook's state.
+   */
   const [state, setState] = useState<SingleViewResourceState<D>>({
     loading: false,
     resource: null,
     error: null,
   });
 
+  const mountedRef = useMountedRef();
+  const { beginRequest, isCurrentRequest, finishRequest } =
+    useLatestRequestLifecycle(mountedRef);
+
   const updateState = useCallback(
     (update: Partial<SingleViewResourceState<D>>) => {
-      setState(currentState => ({ ...currentState, ...update }));
+      if (mountedRef.current) {
+        setState(currentState => ({ ...currentState, ...update }));
+      }
     },
-    [],
+    [mountedRef],
   );
 
   const fetchResource = useCallback(
     (resourceID: number) => {
+      const request = beginRequest();
       // Set loading state
       updateState({
         loading: true,
@@ -296,38 +449,62 @@ export function useSingleViewResource<D extends object = any>(
         pathSuffix !== '' ? `${baseEndpoint}/${pathSuffix}` : baseEndpoint;
       return SupersetClient.get({
         endpoint,
+        signal: request.signal,
       })
         .then(
           ({ json = {} }) => {
-            updateState({
-              resource: json.result,
-              error: null,
-            });
-            return json.result;
+            if (isCurrentRequest(request)) {
+              updateState({
+                resource: json.result,
+                error: null,
+              });
+              return json.result;
+            }
+            return undefined;
           },
-          createErrorHandler((errMsg: Record<string, string[] | string>) => {
-            handleErrorMsg(
-              t(
-                'An error occurred while fetching %ss: %s',
-                resourceLabel,
-                parsedErrorMessage(errMsg),
-              ),
-            );
+          error => {
+            if (!isCurrentRequest(request)) {
+              return undefined;
+            }
+            return createErrorHandler(
+              (errMsg: Record<string, string[] | string>) => {
+                handleErrorMsg(
+                  t(
+                    'An error occurred while fetching %ss: %s',
+                    resourceLabel,
+                    parsedErrorMessage(errMsg),
+                  ),
+                );
 
-            updateState({
-              error: errMsg,
-            });
-          }),
+                updateState({
+                  error: errMsg,
+                });
+              },
+            )(error);
+          },
         )
         .finally(() => {
-          updateState({ loading: false });
+          if (isCurrentRequest(request)) {
+            updateState({ loading: false });
+          }
+          finishRequest(request);
         });
     },
-    [handleErrorMsg, pathSuffix, resourceName, resourceLabel, updateState],
+    [
+      beginRequest,
+      finishRequest,
+      handleErrorMsg,
+      isCurrentRequest,
+      pathSuffix,
+      resourceName,
+      resourceLabel,
+      updateState,
+    ],
   );
 
   const createResource = useCallback(
     (resource: D, hideToast = false) => {
+      const request = beginRequest();
       // Set loading state
       updateState({
         loading: true,
@@ -337,41 +514,64 @@ export function useSingleViewResource<D extends object = any>(
         endpoint: `/api/v1/${resourceName}/`,
         body: JSON.stringify(resource),
         headers: { 'Content-Type': 'application/json' },
+        signal: request.signal,
       })
         .then(
           ({ json = {} }) => {
-            updateState({
-              resource: { id: json.id, ...json.result },
-              error: null,
-            });
-            return json.id;
-          },
-          createErrorHandler((errMsg: Record<string, string[] | string>) => {
-            // we did not want toasts for db-connection-ui but did not want to disable it everywhere
-            if (!hideToast) {
-              handleErrorMsg(
-                t(
-                  'An error occurred while creating %ss: %s',
-                  resourceLabel,
-                  parsedErrorMessage(errMsg),
-                ),
-              );
+            if (isCurrentRequest(request)) {
+              updateState({
+                resource: { id: json.id, ...json.result },
+                error: null,
+              });
+              return json.id;
             }
+            return undefined;
+          },
+          error => {
+            if (!isCurrentRequest(request)) {
+              return undefined;
+            }
+            return createErrorHandler(
+              (errMsg: Record<string, string[] | string>) => {
+                // we did not want toasts for db-connection-ui but did not want to disable it everywhere
+                if (!hideToast) {
+                  handleErrorMsg(
+                    t(
+                      'An error occurred while creating %ss: %s',
+                      resourceLabel,
+                      parsedErrorMessage(errMsg),
+                    ),
+                  );
+                }
 
-            updateState({
-              error: errMsg,
-            });
-          }),
+                updateState({
+                  error: errMsg,
+                });
+              },
+            )(error);
+          },
         )
         .finally(() => {
-          updateState({ loading: false });
+          if (isCurrentRequest(request)) {
+            updateState({ loading: false });
+          }
+          finishRequest(request);
         });
     },
-    [handleErrorMsg, resourceName, resourceLabel, updateState],
+    [
+      beginRequest,
+      finishRequest,
+      handleErrorMsg,
+      isCurrentRequest,
+      resourceName,
+      resourceLabel,
+      updateState,
+    ],
   );
 
   const updateResource = useCallback(
     (resourceID: number, resource: D, hideToast = false, setLoading = true) => {
+      const request = beginRequest();
       // Set loading state
       if (setLoading) {
         updateState({
@@ -383,40 +583,58 @@ export function useSingleViewResource<D extends object = any>(
         endpoint: `/api/v1/${resourceName}/${resourceID}`,
         body: JSON.stringify(resource),
         headers: { 'Content-Type': 'application/json' },
+        signal: request.signal,
       })
         .then(
           ({ json = {} }) => {
-            updateState({
-              resource: { ...json.result, id: json.id },
-              error: null,
-            });
-            return json.result;
-          },
-          createErrorHandler(errMsg => {
-            if (!hideToast) {
-              handleErrorMsg(
-                t(
-                  'An error occurred while fetching %ss: %s',
-                  resourceLabel,
-                  JSON.stringify(errMsg),
-                ),
-              );
+            if (isCurrentRequest(request)) {
+              updateState({
+                resource: { ...json.result, id: json.id },
+                error: null,
+              });
+              return json.result;
             }
+            return undefined;
+          },
+          error => {
+            if (!isCurrentRequest(request)) {
+              return undefined;
+            }
+            return createErrorHandler(errMsg => {
+              if (!hideToast) {
+                handleErrorMsg(
+                  t(
+                    'An error occurred while fetching %ss: %s',
+                    resourceLabel,
+                    JSON.stringify(errMsg),
+                  ),
+                );
+              }
 
-            updateState({
-              error: errMsg,
-            });
+              updateState({
+                error: errMsg,
+              });
 
-            return errMsg;
-          }),
+              return errMsg;
+            })(error);
+          },
         )
         .finally(() => {
-          if (setLoading) {
+          if (setLoading && isCurrentRequest(request)) {
             updateState({ loading: false });
           }
+          finishRequest(request);
         });
     },
-    [handleErrorMsg, resourceName, resourceLabel, updateState],
+    [
+      beginRequest,
+      finishRequest,
+      handleErrorMsg,
+      isCurrentRequest,
+      resourceName,
+      resourceLabel,
+      updateState,
+    ],
   );
 
   const clearError = () =>
@@ -448,11 +666,16 @@ interface ImportResourceState {
   failed: boolean;
 }
 
+// PUBLIC_INTERFACE
 export function useImportResource(
   resourceName: ImportResourceName,
   resourceLabel: string, // resourceLabel for translations
   handleErrorMsg: (errorMsg: string) => void,
 ) {
+  /**
+   * Imports a resource bundle and guards import state against stale completion
+   * from superseded requests or unmounted components.
+   */
   const [state, setState] = useState<ImportResourceState>({
     loading: false,
     passwordsNeeded: [],
@@ -464,9 +687,18 @@ export function useImportResource(
     failed: false,
   });
 
-  const updateState = useCallback((update: Partial<ImportResourceState>) => {
-    setState(currentState => ({ ...currentState, ...update }));
-  }, []);
+  const mountedRef = useMountedRef();
+  const { beginRequest, isCurrentRequest, finishRequest } =
+    useLatestRequestLifecycle(mountedRef);
+
+  const updateState = useCallback(
+    (update: Partial<ImportResourceState>) => {
+      if (mountedRef.current) {
+        setState(currentState => ({ ...currentState, ...update }));
+      }
+    },
+    [mountedRef],
+  );
 
   const importResource = useCallback(
     async (
@@ -478,6 +710,7 @@ export function useImportResource(
       encryptedExtraSecrets: Record<string, Record<string, string>> = {},
       overwrite = false,
     ) => {
+      const request = beginRequest();
       // Set loading state
       updateState({
         loading: true,
@@ -547,21 +780,31 @@ export function useImportResource(
         endpoint: `/api/v1/${resourceName}/import/`,
         body: formData,
         headers: { Accept: 'application/json' },
+        signal: request.signal,
       })
         .then(() => {
-          updateState({
-            passwordsNeeded: [],
-            alreadyExists: [],
-            sshPasswordNeeded: [],
-            sshPrivateKeyNeeded: [],
-            sshPrivateKeyPasswordNeeded: [],
-            encryptedExtraFieldsNeeded: [],
-            failed: false,
-          });
-          return true;
+          if (isCurrentRequest(request)) {
+            updateState({
+              passwordsNeeded: [],
+              alreadyExists: [],
+              sshPasswordNeeded: [],
+              sshPrivateKeyNeeded: [],
+              sshPrivateKeyPasswordNeeded: [],
+              encryptedExtraFieldsNeeded: [],
+              failed: false,
+            });
+            return true;
+          }
+          return false;
         })
-        .catch(response =>
-          getClientErrorObject(response).then(error => {
+        .catch(response => {
+          if (!isCurrentRequest(request)) {
+            return false;
+          }
+          return getClientErrorObject(response).then(error => {
+            if (!isCurrentRequest(request)) {
+              return false;
+            }
             updateState({
               failed: true,
             });
@@ -601,13 +844,24 @@ export function useImportResource(
               });
             }
             return false;
-          }),
-        )
+          });
+        })
         .finally(() => {
-          updateState({ loading: false });
+          if (isCurrentRequest(request)) {
+            updateState({ loading: false });
+          }
+          finishRequest(request);
         });
     },
-    [handleErrorMsg, resourceLabel, resourceName, updateState],
+    [
+      beginRequest,
+      finishRequest,
+      handleErrorMsg,
+      isCurrentRequest,
+      resourceLabel,
+      resourceName,
+      updateState,
+    ],
   );
 
   return { state, importResource };
@@ -638,41 +892,73 @@ const favoriteApis = {
   }),
 };
 
+// PUBLIC_INTERFACE
 export function useFavoriteStatus(
   type: 'chart' | 'dashboard' | 'tag',
   ids: Array<string | number>,
   handleErrorMsg: (message: string) => void,
 ) {
+  /**
+   * Fetches and mutates favorite status while ignoring stale initial status
+   * responses from superseded hook invocations.
+   */
   const [favoriteStatus, setFavoriteStatus] = useState<FavoriteStatus>({});
+  const mountedRef = useMountedRef();
+  const { beginRequest, isCurrentRequest, finishRequest } =
+    useLatestRequestLifecycle(mountedRef);
 
   const updateFavoriteStatus = useCallback(
-    (update: FavoriteStatus) =>
-      setFavoriteStatus(currentState => ({ ...currentState, ...update })),
-    [],
+    (update: FavoriteStatus) => {
+      if (mountedRef.current) {
+        setFavoriteStatus(currentState => ({ ...currentState, ...update }));
+      }
+    },
+    [mountedRef],
   );
 
   useEffect(() => {
     if (!ids.length) {
       return;
     }
-    favoriteApis[type](ids).then(
-      ({ result }) => {
-        const update = result.reduce<Record<string, boolean>>(
-          (acc, element) => {
-            acc[element.id] = element.value;
-            return acc;
-          },
-          {},
-        );
-        updateFavoriteStatus(update);
-      },
-      createErrorHandler(errMsg =>
-        handleErrorMsg(
-          t('There was an error fetching the favorite status: %s', errMsg),
-        ),
-      ),
-    );
-  }, [ids, type, handleErrorMsg, updateFavoriteStatus]);
+    const request = beginRequest();
+
+    favoriteApis[type](ids)
+      .then(
+        ({ result }) => {
+          if (isCurrentRequest(request)) {
+            const update = result.reduce<Record<string, boolean>>(
+              (acc, element) => {
+                acc[element.id] = element.value;
+                return acc;
+              },
+              {},
+            );
+            updateFavoriteStatus(update);
+          }
+        },
+        error => {
+          if (!isCurrentRequest(request)) {
+            return undefined;
+          }
+          return createErrorHandler(errMsg =>
+            handleErrorMsg(
+              t('There was an error fetching the favorite status: %s', errMsg),
+            ),
+          )(error);
+        },
+      )
+      .finally(() => {
+        finishRequest(request);
+      });
+  }, [
+    beginRequest,
+    finishRequest,
+    ids,
+    isCurrentRequest,
+    type,
+    handleErrorMsg,
+    updateFavoriteStatus,
+  ]);
 
   const saveFaveStar = useCallback(
     (id: number, isStarred: boolean) => {
@@ -700,7 +986,7 @@ export function useFavoriteStatus(
   );
 
   return [saveFaveStar, favoriteStatus] as const;
-}
+};
 
 export const useChartEditModal = (
   setCharts: (charts: Array<Chart>) => void,
@@ -784,16 +1070,33 @@ export const testDatabaseConnection = (
   );
 };
 
+// PUBLIC_INTERFACE
 export function useAvailableDatabases() {
+  /**
+   * Loads available database metadata and ignores stale responses after a
+   * newer request or component unmount.
+   */
   const [availableDbs, setAvailableDbs] = useState<JsonObject | null>(null);
+  const mountedRef = useMountedRef();
+  const { beginRequest, isCurrentRequest, finishRequest } =
+    useLatestRequestLifecycle(mountedRef);
 
   const getAvailable = useCallback(() => {
+    const request = beginRequest();
+
     SupersetClient.get({
       endpoint: `/api/v1/database/available/`,
-    }).then(({ json }) => {
-      setAvailableDbs(json);
-    });
-  }, [setAvailableDbs]);
+      signal: request.signal,
+    })
+      .then(({ json }) => {
+        if (isCurrentRequest(request)) {
+          setAvailableDbs(json);
+        }
+      })
+      .finally(() => {
+        finishRequest(request);
+      });
+  }, [beginRequest, finishRequest, isCurrentRequest, setAvailableDbs]);
 
   return [availableDbs, getAvailable] as const;
 }
@@ -813,19 +1116,30 @@ const transformDB = (db: Partial<DatabaseObject> | null) => {
   return db;
 };
 
+// PUBLIC_INTERFACE
 export function useDatabaseValidation() {
+  /**
+   * Validates database parameters with latest-request ownership so stale
+   * validation responses cannot overwrite newer validation state.
+   */
   const [validationErrors, setValidationErrors] = useState<JsonObject | null>(
     null,
   );
   const [isValidating, setIsValidating] = useState(false);
   const [hasValidated, setHasValidated] = useState(false);
+  const mountedRef = useMountedRef();
+  const { beginRequest, isCurrentRequest, finishRequest } =
+    useLatestRequestLifecycle(mountedRef);
 
   const getValidation = useCallback(
     async (database: Partial<DatabaseObject> | null, onCreate = false) => {
+      const request = beginRequest();
+
       if (database?.parameters?.ssh) {
         setValidationErrors(null);
         setIsValidating(false);
         setHasValidated(true);
+        finishRequest(request);
         return Promise.resolve([]);
       }
 
@@ -836,14 +1150,26 @@ export function useDatabaseValidation() {
           endpoint: '/api/v1/database/validate_parameters/',
           body: JSON.stringify(transformDB(database)),
           headers: { 'Content-Type': 'application/json' },
+          signal: request.signal,
         });
-        setValidationErrors(null);
-        setIsValidating(false);
-        setHasValidated(true);
+        if (isCurrentRequest(request)) {
+          setValidationErrors(null);
+          setIsValidating(false);
+          setHasValidated(true);
+        }
+        finishRequest(request);
         return [];
-      } catch (error) {
+      } catch (error: any) {
+        if (!isCurrentRequest(request)) {
+          finishRequest(request);
+          return {};
+        }
         if (typeof error.json === 'function') {
           return error.json().then(({ errors = [] }) => {
+            if (!isCurrentRequest(request)) {
+              finishRequest(request);
+              return {};
+            }
             const parsedErrors = errors
               .filter((err: { error_type: string }) => {
                 const allowed = [
@@ -888,6 +1214,7 @@ export function useDatabaseValidation() {
             setValidationErrors(parsedErrors);
             setIsValidating(false);
             setHasValidated(true);
+            finishRequest(request);
             return parsedErrors;
           });
         }
@@ -895,10 +1222,17 @@ export function useDatabaseValidation() {
         console.error('Unexpected error during validation:', error);
         setIsValidating(false);
         setHasValidated(true);
+        finishRequest(request);
         return {};
       }
     },
-    [setValidationErrors],
+    [
+      beginRequest,
+      finishRequest,
+      isCurrentRequest,
+      setValidationErrors,
+      setHasValidated,
+    ],
   );
 
   return [
