@@ -72,6 +72,19 @@ def _ensure_gamma_variant_roles(sm: Any, examples_pv: Any) -> None:
                 sm.add_permission_role(gamma_no_csv_role, perm)
 
 
+def _ensure_openapi_access(sm: Any) -> None:
+    """
+    Ensure the FAB OpenAPI spec endpoint permission exists and is granted to Admin.
+
+    Some integration tests expect `/api/v1/_openapi` to be accessible to the admin
+    test user, which requires `can_get` on the `OpenApi` view-menu.
+    """
+    openapi_pvm = sm.add_permission_view_menu("can_get", "OpenApi")
+    admin_role = sm.find_role("Admin")
+    if admin_role:
+        sm.add_permission_role(admin_role, openapi_pvm)
+
+
 def _seed_users(sm: Any) -> None:
     """
     Seed canonical integration-test users if missing.
@@ -128,6 +141,7 @@ def _seed_standard_test_users() -> None:
     # Create/ensure the special "gamma_*" roles and attach permissions, mirroring
     # `superset/cli/test.py::load_test_users`.
     _ensure_gamma_variant_roles(sm, examples_pv)
+    _ensure_openapi_access(sm)
     _seed_users(sm)
 
     db.session.commit()
