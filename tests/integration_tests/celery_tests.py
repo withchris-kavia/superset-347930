@@ -117,10 +117,24 @@ def run_sql(
 
 def drop_table_if_exists(table_name: str, table_type: CTASMethod) -> None:
     """Drop table if it exists, works on any DB"""
-    sql = f"DROP {table_type.name} IF EXISTS {table_name}"
     database = get_example_database()
     with database.get_sqla_engine() as engine:
-        engine.execute(sql)
+        sql = f"DROP {table_type.name} IF EXISTS {table_name}"
+        try:
+            engine.execute(sql)
+        except Exception as ex:
+            # SQLite is strict about object types: dropping a VIEW with DROP TABLE
+            # (or vice-versa) raises an error even when using IF EXISTS.
+            if backend() != "sqlite":
+                raise
+
+            msg = str(ex)
+            if "use DROP VIEW to delete view" in msg:
+                engine.execute(f"DROP VIEW IF EXISTS {table_name}")
+            elif "use DROP TABLE to delete table" in msg:
+                engine.execute(f"DROP TABLE IF EXISTS {table_name}")
+            else:
+                raise
 
 
 def quote_f(value: Optional[str]):

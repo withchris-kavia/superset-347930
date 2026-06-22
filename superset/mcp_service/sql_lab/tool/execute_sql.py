@@ -22,14 +22,14 @@ Tool for executing SQL queries against databases using the unified
 Database.execute() API with RLS, template rendering, and security validation.
 """
 
-from decimal import Decimal
 import logging
+from decimal import Decimal
 from typing import Any
 
-from fastmcp import Context
 import pandas as pd
+from fastmcp import Context
 
-from superset_core.mcp.decorators import ToolAnnotations, tool
+from superset_core.mcp.decorators import tool, ToolAnnotations
 from superset_core.queries.types import (
     CacheOptions,
     QueryOptions,
@@ -48,8 +48,8 @@ from superset.mcp_service.sql_lab.schemas import (
     StatementInfo,
 )
 from superset.mcp_service.utils.oauth2_utils import (
-    OAUTH2_CONFIG_ERROR_MESSAGE,
     build_oauth2_redirect_message,
+    OAUTH2_CONFIG_ERROR_MESSAGE,
 )
 from superset.sql.parse import SQLScript
 
