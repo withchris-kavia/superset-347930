@@ -186,6 +186,8 @@ const FilterValue: FC<FilterValueProps> = ({
   const [isLoading, setIsLoading] = useState<boolean>(hasDataSource);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const dispatch = useDispatch();
+  const latestRequestIdRef = useRef(0);
+  const activeControllerRef = useRef<AbortController | null>(null);
 
   const { outlinedFilterId, lastUpdated } = useFilterOutlined();
 
@@ -196,6 +198,13 @@ const FilterValue: FC<FilterValueProps> = ({
       dispatch(onFiltersRefreshSuccess());
     }
   }, [dispatch, shouldRefresh]);
+
+  useEffect(
+    () => () => {
+      activeControllerRef.current?.abort();
+    },
+    [],
+  );
 
   useEffect(() => {
     setHasDepsFilterValue(hasDeps);
@@ -274,13 +283,26 @@ const FilterValue: FC<FilterValueProps> = ({
       if (!hasDataSource) {
         return;
       }
+      activeControllerRef.current?.abort();
+      const controller = new AbortController();
+      activeControllerRef.current = controller;
+      const requestId = latestRequestIdRef.current + 1;
+      latestRequestIdRef.current = requestId;
+      const isCurrentRequest = () =>
+        latestRequestIdRef.current === requestId && !controller.signal.aborted;
       setIsRefreshing(true);
       getChartDataRequest({
         formData: newFormData,
         force: shouldRefresh,
         ownState: filterOwnState,
+        requestParams: {
+          signal: controller.signal,
+        },
       })
         .then(({ response, json }) => {
+          if (!isCurrentRequest()) {
+            return;
+          }
           if (isFeatureEnabled(FeatureFlag.GlobalAsyncQueries)) {
             // deal with getChartDataRequest transforming the response data
             const result = 'result' in json ? json.result[0] : json;
@@ -293,8 +315,14 @@ const FilterValue: FC<FilterValueProps> = ({
               setError(undefined);
               handleFilterLoadFinish();
             } else if (response.status === 202) {
-              waitForAsyncData(result as Parameters<typeof waitForAsyncData>[0])
+              waitForAsyncData(
+                result as Parameters<typeof waitForAsyncData>[0],
+                { signal: controller.signal },
+              )
                 .then((asyncResult: ChartDataResponseResult[]) => {
+                  if (!isCurrentRequest()) {
+                    return;
+                  }
                   setState(
                     applyTimeGrainAllowlist(
                       filterType,
@@ -306,7 +334,13 @@ const FilterValue: FC<FilterValueProps> = ({
                   handleFilterLoadFinish();
                 })
                 .catch((error: Response) => {
+                  if (!isCurrentRequest()) {
+                    return;
+                  }
                   getClientErrorObject(error).then(clientErrorObject => {
+                    if (!isCurrentRequest()) {
+                      return;
+                    }
                     setError(clientErrorObject);
                     handleFilterLoadFinish();
                   });
@@ -329,7 +363,13 @@ const FilterValue: FC<FilterValueProps> = ({
           }
         })
         .catch((error: Response) => {
+          if (!isCurrentRequest()) {
+            return;
+          }
           getClientErrorObject(error).then(clientErrorObject => {
+            if (!isCurrentRequest()) {
+              return;
+            }
             setError(clientErrorObject);
             handleFilterLoadFinish();
           });

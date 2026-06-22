@@ -326,6 +326,8 @@ const FiltersConfigForm = (
   const filters = form.getFieldValue('filters');
   const formValues = filters?.[filterId];
   const formFilter = formValues || undoFormValues || defaultFormFilter;
+  const latestRefreshRequestIdRef = useRef(0);
+  const activeRefreshControllerRef = useRef<AbortController | null>(null);
   const formFilterWithTimeGrains = formFilter as typeof formFilter & {
     time_grains?: string[];
   };
@@ -489,6 +491,13 @@ const FiltersConfigForm = (
 
   const dependenciesText = JSON.stringify(dependenciesDefaultValues);
 
+  useEffect(
+    () => () => {
+      activeRefreshControllerRef.current?.abort();
+    },
+    [],
+  );
+
   const refreshHandler = useCallback(
     (force = false) => {
       if (!hasDataset || !datasetId) {
@@ -503,6 +512,15 @@ const FiltersConfigForm = (
       });
       formData.extra_form_data = dependenciesDefaultValues;
 
+      activeRefreshControllerRef.current?.abort();
+      const controller = new AbortController();
+      activeRefreshControllerRef.current = controller;
+      const requestId = latestRefreshRequestIdRef.current + 1;
+      latestRefreshRequestIdRef.current = requestId;
+      const isCurrentRequest = () =>
+        latestRefreshRequestIdRef.current === requestId &&
+        !controller.signal.aborted;
+
       setNativeFilterFieldValuesWrapper({
         defaultValueQueriesData: null,
         isDataDirty: false,
@@ -510,8 +528,14 @@ const FiltersConfigForm = (
       getChartDataRequest({
         formData,
         force,
+        requestParams: {
+          signal: controller.signal,
+        },
       })
         .then(({ response, json }) => {
+          if (!isCurrentRequest()) {
+            return;
+          }
           if (isFeatureEnabled(FeatureFlag.GlobalAsyncQueries)) {
             // deal with getChartDataRequest transforming the response data
             const result = 'result' in json ? json.result[0] : json;
@@ -521,14 +545,26 @@ const FiltersConfigForm = (
                 defaultValueQueriesData: [result as ChartDataResponseResult],
               });
             } else if (response.status === 202) {
-              waitForAsyncData(result as Parameters<typeof waitForAsyncData>[0])
+              waitForAsyncData(
+                result as Parameters<typeof waitForAsyncData>[0],
+                { signal: controller.signal },
+              )
                 .then((asyncResult: ChartDataResponseResult[]) => {
+                  if (!isCurrentRequest()) {
+                    return;
+                  }
                   setNativeFilterFieldValuesWrapper({
                     defaultValueQueriesData: asyncResult,
                   });
                 })
                 .catch((error: Response) => {
+                  if (!isCurrentRequest()) {
+                    return;
+                  }
                   getClientErrorObject(error).then(clientErrorObject => {
+                    if (!isCurrentRequest()) {
+                      return;
+                    }
                     setErrorWrapper(clientErrorObject);
                   });
                 });
@@ -544,7 +580,13 @@ const FiltersConfigForm = (
           }
         })
         .catch((error: Response) => {
+          if (!isCurrentRequest()) {
+            return;
+          }
           getClientErrorObject(error).then(clientErrorObject => {
+            if (!isCurrentRequest()) {
+              return;
+            }
             setError(clientErrorObject);
           });
         });

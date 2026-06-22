@@ -73,9 +73,9 @@ test('useListViewResource: fetches permissions on mount', async () => {
   );
 
   await waitFor(() => {
-    expect(getSpy).toHaveBeenCalledWith({
+    expect(getSpy).toHaveBeenCalledWith(expect.objectContaining({
       endpoint: expect.stringContaining('/api/v1/chart/_info'),
-    });
+    }));
   });
 
   await waitFor(() => {
@@ -310,12 +310,12 @@ test('useListViewResource: refreshData re-fetches with last config', async () =>
     await result.current.refreshData();
   });
 
-  expect(getSpy).toHaveBeenCalledWith({
+  expect(getSpy).toHaveBeenCalledWith(expect.objectContaining({
     endpoint: expect.stringContaining('page:2'),
-  });
-  expect(getSpy).toHaveBeenCalledWith({
+  }));
+  expect(getSpy).toHaveBeenCalledWith(expect.objectContaining({
     endpoint: expect.stringContaining('page_size:50'),
-  });
+  }));
 });
 
 test('useListViewResource: refreshData returns null when no cached config', () => {
@@ -395,6 +395,188 @@ test('useListViewResource: uses desc sort direction when desc is true', async ()
   expect(endpoint).toContain('order_direction:desc');
 });
 
+test('useListViewResource: ignores stale fetchData success from an older request', async () => {
+  const firstData = [{ id: 1, name: 'stale' }];
+  const secondData = [{ id: 2, name: 'current' }];
+  let resolveFirst: ((value: unknown) => void) | undefined;
+  let resolveSecond: ((value: unknown) => void) | undefined;
+
+  jest
+    .spyOn(SupersetClient, 'get')
+    .mockImplementationOnce(
+      () =>
+        new Promise(resolve => {
+          resolveFirst = resolve;
+        }) as Promise<JsonResponse>,
+    )
+    .mockImplementationOnce(
+      () =>
+        new Promise(resolve => {
+          resolveSecond = resolve;
+        }) as Promise<JsonResponse>,
+    );
+
+  const { result } = renderHook(() =>
+    useListViewResource('chart', 'Charts', jest.fn(), false),
+  );
+
+  act(() => {
+    result.current.fetchData({
+      pageIndex: 0,
+      pageSize: 10,
+      sortBy: [{ id: 'name' }],
+      filters: [],
+    });
+  });
+
+  act(() => {
+    result.current.fetchData({
+      pageIndex: 1,
+      pageSize: 10,
+      sortBy: [{ id: 'name' }],
+      filters: [],
+    });
+  });
+
+  await act(async () => {
+    resolveSecond?.({ json: { result: secondData, count: 1 } });
+  });
+
+  await waitFor(() => {
+    expect(result.current.state.resourceCollection).toEqual(secondData);
+    expect(result.current.state.resourceCount).toBe(1);
+    expect(result.current.state.loading).toBe(false);
+  });
+
+  await act(async () => {
+    resolveFirst?.({ json: { result: firstData, count: 1 } });
+  });
+
+  expect(result.current.state.resourceCollection).toEqual(secondData);
+});
+
+test('useListViewResource: aborts the previous fetchData request when a newer request starts', () => {
+  const getSpy = jest.spyOn(SupersetClient, 'get').mockImplementation(
+    () =>
+      new Promise(() => {
+        // Keep requests pending so cancellation state can be inspected.
+      }) as Promise<JsonResponse>,
+  );
+
+  const { result } = renderHook(() =>
+    useListViewResource('chart', 'Charts', jest.fn(), false),
+  );
+
+  act(() => {
+    result.current.fetchData({
+      pageIndex: 0,
+      pageSize: 10,
+      sortBy: [{ id: 'name' }],
+      filters: [],
+    });
+  });
+
+  const firstSignal = (getSpy.mock.calls[0][0] as { signal?: AbortSignal })
+    .signal;
+  expect(firstSignal?.aborted).toBe(false);
+
+  act(() => {
+    result.current.fetchData({
+      pageIndex: 1,
+      pageSize: 10,
+      sortBy: [{ id: 'name' }],
+      filters: [],
+    });
+  });
+
+  const secondSignal = (getSpy.mock.calls[1][0] as { signal?: AbortSignal })
+    .signal;
+  expect(firstSignal?.aborted).toBe(true);
+  expect(secondSignal?.aborted).toBe(false);
+});
+
+test('useListViewResource: ignores stale fetchData errors from an older request', async () => {
+  let rejectFirst: ((value: unknown) => void) | undefined;
+  let resolveSecond: ((value: unknown) => void) | undefined;
+  const handleErrorMsg = jest.fn();
+
+  jest
+    .spyOn(SupersetClient, 'get')
+    .mockImplementationOnce(
+      () =>
+        new Promise((_, reject) => {
+          rejectFirst = reject;
+        }) as Promise<JsonResponse>,
+    )
+    .mockImplementationOnce(
+      () =>
+        new Promise(resolve => {
+          resolveSecond = resolve;
+        }) as Promise<JsonResponse>,
+    );
+
+  const { result } = renderHook(() =>
+    useListViewResource('chart', 'Charts', handleErrorMsg, false),
+  );
+
+  act(() => {
+    result.current.fetchData({
+      pageIndex: 0,
+      pageSize: 10,
+      sortBy: [{ id: 'name' }],
+      filters: [],
+    });
+  });
+
+  act(() => {
+    result.current.fetchData({
+      pageIndex: 1,
+      pageSize: 10,
+      sortBy: [{ id: 'name' }],
+      filters: [],
+    });
+  });
+
+  await act(async () => {
+    rejectFirst?.(new Error('stale failure'));
+    resolveSecond?.({ json: { result: [], count: 0 } });
+  });
+
+  await waitFor(() => {
+    expect(result.current.state.loading).toBe(false);
+  });
+  expect(handleErrorMsg).not.toHaveBeenCalled();
+});
+
+test('useListViewResource: aborts active fetchData request on unmount', () => {
+  const getSpy = jest.spyOn(SupersetClient, 'get').mockImplementation(
+    () =>
+      new Promise(() => {
+        // Keep request pending so unmount cleanup owns cancellation.
+      }) as Promise<JsonResponse>,
+  );
+
+  const { result, unmount } = renderHook(() =>
+    useListViewResource('chart', 'Charts', jest.fn(), false),
+  );
+
+  act(() => {
+    result.current.fetchData({
+      pageIndex: 0,
+      pageSize: 10,
+      sortBy: [{ id: 'name' }],
+      filters: [],
+    });
+  });
+
+  const signal = (getSpy.mock.calls[0][0] as { signal?: AbortSignal }).signal;
+  expect(signal?.aborted).toBe(false);
+
+  unmount();
+
+  expect(signal?.aborted).toBe(true);
+});
+
 // useSingleViewResource
 test('useSingleViewResource: initial state has loading false and null resource', () => {
   const { result } = renderHook(() =>
@@ -420,9 +602,9 @@ test('useSingleViewResource: fetchResource calls correct endpoint', async () => 
     await result.current.fetchResource(42);
   });
 
-  expect(getSpy).toHaveBeenCalledWith({
+  expect(getSpy).toHaveBeenCalledWith(expect.objectContaining({
     endpoint: '/api/v1/chart/42',
-  });
+  }));
 
   await waitFor(() => {
     expect(result.current.state.resource).toEqual(mockResult);
@@ -444,9 +626,9 @@ test('useSingleViewResource: fetchResource appends pathSuffix', async () => {
     await result.current.fetchResource(42);
   });
 
-  expect(getSpy).toHaveBeenCalledWith({
+  expect(getSpy).toHaveBeenCalledWith(expect.objectContaining({
     endpoint: '/api/v1/chart/42/related_objects',
-  });
+  }));
 });
 
 test('useSingleViewResource: createResource posts to correct endpoint', async () => {
@@ -465,11 +647,11 @@ test('useSingleViewResource: createResource posts to correct endpoint', async ()
     } as any);
   });
 
-  expect(postSpy).toHaveBeenCalledWith({
+  expect(postSpy).toHaveBeenCalledWith(expect.objectContaining({
     endpoint: '/api/v1/chart/',
     body: JSON.stringify({ name: 'New Chart' }),
     headers: { 'Content-Type': 'application/json' },
-  });
+  }));
   expect(createdId).toBe(99);
 
   await waitFor(() => {
@@ -490,11 +672,11 @@ test('useSingleViewResource: updateResource puts to correct endpoint', async () 
     await result.current.updateResource(42, { name: 'Updated' } as any);
   });
 
-  expect(putSpy).toHaveBeenCalledWith({
+  expect(putSpy).toHaveBeenCalledWith(expect.objectContaining({
     endpoint: '/api/v1/chart/42',
     body: JSON.stringify({ name: 'Updated' }),
     headers: { 'Content-Type': 'application/json' },
-  });
+  }));
 
   await waitFor(() => {
     expect(result.current.state.resource).toEqual({ name: 'Updated', id: 42 });
@@ -539,6 +721,143 @@ test('useSingleViewResource: setResource updates the resource', () => {
   });
 
   expect(result.current.state.resource).toEqual({ id: 1, name: 'Manual' });
+});
+
+test('useSingleViewResource: ignores stale fetchResource success from an older request', async () => {
+  let resolveFirst: ((value: unknown) => void) | undefined;
+  let resolveSecond: ((value: unknown) => void) | undefined;
+
+  jest
+    .spyOn(SupersetClient, 'get')
+    .mockImplementationOnce(
+      () =>
+        new Promise(resolve => {
+          resolveFirst = resolve;
+        }) as Promise<JsonResponse>,
+    )
+    .mockImplementationOnce(
+      () =>
+        new Promise(resolve => {
+          resolveSecond = resolve;
+        }) as Promise<JsonResponse>,
+    );
+
+  const { result } = renderHook(() =>
+    useSingleViewResource('chart', 'Charts', jest.fn()),
+  );
+
+  act(() => {
+    result.current.fetchResource(1);
+  });
+  act(() => {
+    result.current.fetchResource(2);
+  });
+
+  await act(async () => {
+    resolveSecond?.({ json: { result: { id: 2, name: 'current' } } });
+  });
+
+  await waitFor(() => {
+    expect(result.current.state.resource).toEqual({
+      id: 2,
+      name: 'current',
+    });
+    expect(result.current.state.loading).toBe(false);
+  });
+
+  await act(async () => {
+    resolveFirst?.({ json: { result: { id: 1, name: 'stale' } } });
+  });
+
+  expect(result.current.state.resource).toEqual({
+    id: 2,
+    name: 'current',
+  });
+});
+
+test('useSingleViewResource: aborts the previous fetchResource request when a newer request starts', () => {
+  const getSpy = jest.spyOn(SupersetClient, 'get').mockImplementation(
+    () =>
+      new Promise(() => {
+        // Keep requests pending so cancellation state can be inspected.
+      }) as Promise<JsonResponse>,
+  );
+
+  const { result } = renderHook(() =>
+    useSingleViewResource('chart', 'Charts', jest.fn()),
+  );
+
+  act(() => {
+    result.current.fetchResource(1);
+  });
+
+  const firstSignal = (getSpy.mock.calls[0][0] as { signal?: AbortSignal })
+    .signal;
+  expect(firstSignal?.aborted).toBe(false);
+
+  act(() => {
+    result.current.fetchResource(2);
+  });
+
+  const secondSignal = (getSpy.mock.calls[1][0] as { signal?: AbortSignal })
+    .signal;
+  expect(firstSignal?.aborted).toBe(true);
+  expect(secondSignal?.aborted).toBe(false);
+});
+
+test('useSingleViewResource: ignores stale fetchResource errors from an older request', async () => {
+  let rejectFirst: ((value: unknown) => void) | undefined;
+  let resolveSecond: ((value: unknown) => void) | undefined;
+  const handleErrorMsg = jest.fn();
+
+  jest
+    .spyOn(SupersetClient, 'get')
+    .mockImplementationOnce(
+      () =>
+        new Promise((_, reject) => {
+          rejectFirst = reject;
+        }) as Promise<JsonResponse>,
+    )
+    .mockImplementationOnce(
+      () =>
+        new Promise(resolve => {
+          resolveSecond = resolve;
+        }) as Promise<JsonResponse>,
+    );
+
+  const { result } = renderHook(() =>
+    useSingleViewResource('chart', 'Charts', handleErrorMsg),
+  );
+
+  act(() => {
+    result.current.fetchResource(1);
+  });
+  act(() => {
+    result.current.fetchResource(2);
+  });
+
+  await act(async () => {
+    resolveSecond?.({ json: { result: { id: 2, name: 'current' } } });
+  });
+
+  await waitFor(() => {
+    expect(result.current.state.resource).toEqual({
+      id: 2,
+      name: 'current',
+    });
+    expect(result.current.state.loading).toBe(false);
+  });
+
+  await act(async () => {
+    rejectFirst?.(new Error('stale failure'));
+  });
+
+  expect(handleErrorMsg).not.toHaveBeenCalled();
+  expect(result.current.state.error).toBeNull();
+  expect(result.current.state.resource).toEqual({
+    id: 2,
+    name: 'current',
+  });
 });
 
 // useFavoriteStatus

@@ -270,6 +270,107 @@ test('fetches and displays remote options via fetchSelects on mount', async () =
   expect(fetchSelects).toHaveBeenCalledWith('', 0, 200);
 });
 
+test('ignores stale remote options when an older fetch resolves after a newer fetch', async () => {
+  let resolveFirst:
+    | ((value: { data: { label: string; value: number }[]; totalCount: number }) => void)
+    | undefined;
+  let resolveSecond:
+    | ((value: { data: { label: string; value: number }[]; totalCount: number }) => void)
+    | undefined;
+  const firstFetchSelects = jest.fn(
+    () =>
+      new Promise(resolve => {
+        resolveFirst = resolve;
+      }),
+  );
+  const secondFetchSelects = jest.fn(
+    () =>
+      new Promise(resolve => {
+        resolveSecond = resolve;
+      }),
+  );
+
+  const { rerender } = render(
+    <CompactSelectPanel
+      fetchSelects={firstFetchSelects}
+      value={undefined}
+      onSelect={jest.fn()}
+    />,
+  );
+
+  await waitFor(() => {
+    expect(firstFetchSelects).toHaveBeenCalledWith('', 0, 200);
+  });
+
+  rerender(
+    <CompactSelectPanel
+      fetchSelects={secondFetchSelects}
+      value={undefined}
+      onSelect={jest.fn()}
+    />,
+  );
+
+  await waitFor(() => {
+    expect(secondFetchSelects).toHaveBeenCalledWith('', 0, 200);
+  });
+
+  await act(async () => {
+    resolveSecond?.({
+      data: [{ label: 'Current User', value: 2 }],
+      totalCount: 1,
+    });
+  });
+
+  await waitFor(() => {
+    expect(screen.getByText('Current User')).toBeInTheDocument();
+  });
+
+  await act(async () => {
+    resolveFirst?.({
+      data: [{ label: 'Stale User', value: 1 }],
+      totalCount: 1,
+    });
+  });
+
+  expect(screen.getByText('Current User')).toBeInTheDocument();
+  expect(screen.queryByText('Stale User')).not.toBeInTheDocument();
+});
+
+test('does not render remote options from an unmounted fetchSelects request', async () => {
+  let resolveFetch:
+    | ((value: { data: { label: string; value: number }[]; totalCount: number }) => void)
+    | undefined;
+  const fetchSelects = jest.fn(
+    () =>
+      new Promise(resolve => {
+        resolveFetch = resolve;
+      }),
+  );
+
+  const { unmount } = render(
+    <CompactSelectPanel
+      fetchSelects={fetchSelects}
+      value={undefined}
+      onSelect={jest.fn()}
+    />,
+  );
+
+  await waitFor(() => {
+    expect(fetchSelects).toHaveBeenCalledWith('', 0, 200);
+  });
+
+  unmount();
+
+  await act(async () => {
+    resolveFetch?.({
+      data: [{ label: 'Unmounted User', value: 3 }],
+      totalCount: 1,
+    });
+  });
+
+  expect(screen.queryByText('Unmounted User')).not.toBeInTheDocument();
+});
+
 test('shows No results when fetchSelects returns empty data', async () => {
   const fetchSelects = jest.fn().mockResolvedValue({ data: [], totalCount: 0 });
   render(

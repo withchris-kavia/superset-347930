@@ -45,6 +45,9 @@ type CachedDataResponse = {
 };
 type AppConfig = Record<string, any>;
 type ListenerFn = (asyncEvent: AsyncEvent) => Promise<any>;
+type WaitForAsyncDataOptions = {
+  signal?: AbortSignal;
+};
 
 const TRANSPORT_POLLING = 'polling';
 const TRANSPORT_WS = 'ws';
@@ -66,6 +69,7 @@ let pollingTimeoutId: number;
 let listenersByJobId: Map<string, ListenerFn>;
 let retriesByJobId: Map<string, number>;
 let lastReceivedEventId: string | null | undefined;
+let pollingGeneration = 0;
 
 const addListener = (id: string, fn: ListenerFn) => {
   listenersByJobId.set(id, fn);
@@ -78,15 +82,20 @@ const removeListener = (id: string) => {
 
 const fetchCachedData = async (
   asyncEvent: AsyncEvent,
+  signal?: AbortSignal,
 ): Promise<CachedDataResponse> => {
   let status = 'success';
   let data;
   try {
     const { json } = await SupersetClient.get({
       endpoint: String(asyncEvent.result_url),
+      signal,
     });
     data = 'result' in json ? json.result : json;
   } catch (response) {
+    if (signal?.aborted) {
+      throw createAbortError();
+    }
     status = 'error';
     data = await getClientErrorObject(response);
   }
@@ -94,31 +103,94 @@ const fetchCachedData = async (
   return { status, data };
 };
 
-export const waitForAsyncData = async (asyncResponse: AsyncEvent) =>
+const createAbortError = () => {
+  const error =
+    typeof DOMException === 'function'
+      ? new DOMException('The async data request was aborted.', 'AbortError')
+      : new Error('The async data request was aborted.');
+  error.name = 'AbortError';
+  return error;
+};
+
+// PUBLIC_INTERFACE
+export const waitForAsyncData = async (
+  asyncResponse: AsyncEvent,
+  options: WaitForAsyncDataOptions = {},
+) =>
+  /**
+   * Waits for an async query completion event and resolves with cached query
+   * data. When an AbortSignal is provided, listener registration and cached
+   * data retrieval are cancelled together so stale callers cannot receive late
+   * async results.
+   */
   new Promise((resolve, reject) => {
     const jobId = asyncResponse.job_id;
-    const listener = async (asyncEvent: AsyncEvent) => {
-      switch (asyncEvent.status) {
-        case JOB_STATUS.DONE: {
-          let { data, status } = await fetchCachedData(asyncEvent); // eslint-disable-line prefer-const
-          data = ensureIsArray(data);
-          if (status === 'success') {
-            resolve(data);
-          } else {
-            reject(data);
-          }
-          break;
-        }
-        case JOB_STATUS.ERROR: {
-          const err = parseErrorJson(asyncEvent);
-          reject(err);
-          break;
-        }
-        default: {
-          logging.warn('received event with status', asyncEvent.status);
-        }
-      }
+    const { signal } = options;
+    let settled = false;
+
+    const cleanup = () => {
+      signal?.removeEventListener('abort', abortListener);
       removeListener(jobId);
+    };
+
+    const settle = (
+      settleFn: (value: any) => void,
+      value: unknown,
+    ) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      settleFn(value);
+    };
+
+    const abortListener = () => {
+      settle(reject, createAbortError());
+    };
+
+    if (signal?.aborted) {
+      abortListener();
+      return;
+    }
+
+    signal?.addEventListener('abort', abortListener, { once: true });
+
+    const listener = async (asyncEvent: AsyncEvent) => {
+      if (signal?.aborted) {
+        abortListener();
+        return;
+      }
+
+      try {
+        switch (asyncEvent.status) {
+          case JOB_STATUS.DONE: {
+            let { data, status } = await fetchCachedData(asyncEvent, signal); // eslint-disable-line prefer-const
+            if (signal?.aborted) {
+              abortListener();
+              return;
+            }
+            data = ensureIsArray(data);
+            if (status === 'success') {
+              settle(resolve, data);
+            } else {
+              settle(reject, data);
+            }
+            break;
+          }
+          case JOB_STATUS.ERROR: {
+            const err = parseErrorJson(asyncEvent);
+            settle(reject, err);
+            break;
+          }
+          default: {
+            logging.warn('received event with status', asyncEvent.status);
+            cleanup();
+          }
+        }
+      } catch (error) {
+        settle(reject, error);
+      }
     };
     addListener(jobId, listener);
   });
@@ -170,19 +242,25 @@ export const processEvents = async (events: AsyncEvent[]) => {
   });
 };
 
-const loadEventsFromApi = async () => {
+const loadEventsFromApi = async (generation = pollingGeneration) => {
   const eventArgs = lastReceivedEventId ? { last_id: lastReceivedEventId } : {};
   if (listenersByJobId.size) {
     try {
       const { result: events } = await fetchEvents(eventArgs);
+      if (generation !== pollingGeneration) {
+        return;
+      }
       if (events?.length) await processEvents(events);
     } catch (err) {
       logging.warn(err);
     }
   }
 
-  if (transport === TRANSPORT_POLLING) {
-    pollingTimeoutId = window.setTimeout(loadEventsFromApi, pollingDelayMs);
+  if (transport === TRANSPORT_POLLING && generation === pollingGeneration) {
+    pollingTimeoutId = window.setTimeout(
+      () => loadEventsFromApi(generation),
+      pollingDelayMs,
+    );
   }
 };
 
@@ -234,6 +312,7 @@ const wsConnect = (): void => {
 export const init = (appConfig?: AppConfig) => {
   if (!isFeatureEnabled(FeatureFlag.GlobalAsyncQueries)) return;
   if (pollingTimeoutId) clearTimeout(pollingTimeoutId);
+  pollingGeneration += 1;
 
   listenersByJobId = new Map();
   retriesByJobId = new Map();
