@@ -42,6 +42,76 @@ if TYPE_CHECKING:
 CTAS_SCHEMA_NAME = "sqllab_test_db"
 ADMIN_SCHEMA_NAME = "admin_database"
 
+def _seed_standard_test_users() -> None:
+    """
+    Seed the standard set of users/roles expected by integration tests.
+
+    A number of integration tests assume the presence of the canonical
+    test users (admin/alpha/gamma/...) as created by the
+    `superset load-test-users` CLI command (see `superset/cli/test.py`).
+
+    In some CI environments the metadata DB is created without those users,
+    causing `security_manager.find_user("alpha")` to return None and tests
+    like `tests/integration_tests/access_tests.py::test_get_user_id` to fail.
+
+    This is intentionally implemented as test-only bootstrap to avoid
+    changing runtime behavior of Superset itself.
+    """
+
+    from superset.utils.database import get_example_database
+
+    sm = security_manager
+
+    # Ensure the example DB exists; the CLI seeding logic attaches database
+    # access permissions to roles using the example DB perm string.
+    examples_db = get_example_database()
+    examples_pv = sm.add_permission_view_menu("database_access", examples_db.perm)
+
+    # Ensure built-in roles/permissions exist.
+    sm.sync_role_definitions()
+
+    # Create/ensure the special "gamma_*" roles and attach permissions, mirroring
+    # `superset/cli/test.py::load_test_users`.
+    gamma_sqllab_role = sm.find_role("gamma_sqllab") or sm.add_role("gamma_sqllab")
+    sm.add_permission_role(gamma_sqllab_role, examples_pv)
+
+    gamma_no_csv_role = sm.find_role("gamma_no_csv") or sm.add_role("gamma_no_csv")
+    sm.add_permission_role(gamma_no_csv_role, examples_pv)
+
+    for role_name in ["Gamma", "sql_lab"]:
+        base_role = sm.find_role(role_name)
+        if not base_role:
+            # Defensive: in unexpected configurations, don't hard-fail seeding.
+            continue
+        for perm in base_role.permissions:
+            sm.add_permission_role(gamma_sqllab_role, perm)
+            if str(perm) != "can csv on Superset":
+                sm.add_permission_role(gamma_no_csv_role, perm)
+
+    # Create users in a deterministic order so integration tests that rely on
+    # stable IDs (e.g. gamma=2, alpha=5) continue to work in fresh databases.
+    users_to_seed = (
+        ("admin", "Admin"),
+        ("gamma", "Gamma"),
+        ("gamma2", "Gamma"),
+        ("gamma_sqllab", "gamma_sqllab"),
+        ("alpha", "Alpha"),
+        ("gamma_no_csv", "gamma_no_csv"),
+    )
+    for username, role_name in users_to_seed:
+        if sm.find_user(username=username):
+            continue
+        sm.add_user(
+            username,
+            username,
+            "user",
+            f"{username}@fab.org",
+            sm.find_role(role_name),
+            password="general",  # noqa: S106
+        )
+
+    db.session.commit()
+
 
 @pytest.fixture
 def app_context():
@@ -122,6 +192,9 @@ def setup_sample_data() -> Any:
     # relying on `tests.integration_tests.test_app.app` leveraging an `app` fixture
     # which is purposely scoped to the function level to ensure tests remain idempotent.
     with app.app_context():
+        # Ensure canonical test users exist for integration tests which rely on them.
+        _seed_standard_test_users()
+
         try:
             setup_presto_if_needed()
         except Exception:  # noqa: S110

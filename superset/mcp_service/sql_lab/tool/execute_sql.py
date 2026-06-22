@@ -28,13 +28,8 @@ from typing import Any
 
 import pandas as pd
 from fastmcp import Context
-from superset_core.mcp.decorators import tool, ToolAnnotations
-from superset_core.queries.types import (
-    CacheOptions,
-    QueryOptions,
-    QueryResult,
-    QueryStatus,
-)
+from superset_core.mcp.decorators import ToolAnnotations, tool
+from superset_core.queries.types import CacheOptions, QueryOptions, QueryResult, QueryStatus
 
 from superset.errors import SupersetErrorType
 from superset.exceptions import OAuth2Error, OAuth2RedirectError
@@ -47,26 +42,15 @@ from superset.mcp_service.sql_lab.schemas import (
     StatementInfo,
 )
 from superset.mcp_service.utils.oauth2_utils import (
-    build_oauth2_redirect_message,
     OAUTH2_CONFIG_ERROR_MESSAGE,
+    build_oauth2_redirect_message,
 )
 from superset.sql.parse import SQLScript
 
 logger = logging.getLogger(__name__)
 
 
-@tool(
-    tags=["mutate"],
-    class_permission_name="SQLLab",
-    method_permission_name="execute_sql_query",
-    annotations=ToolAnnotations(
-        title="Execute SQL query",
-        readOnlyHint=False,
-        destructiveHint=True,
-    ),
-)
-async def execute_sql(request: ExecuteSqlRequest, ctx: Context) -> ExecuteSqlResponse:
-    """Execute SQL query against database using the unified Database.execute() API."""
+async def _log_start(request: ExecuteSqlRequest, ctx: Context) -> None:
     await ctx.info(
         "Starting SQL execution: database_id=%s, timeout=%s, limit=%s, schema=%s"
         % (request.database_id, request.timeout, request.limit, request.schema_name)
@@ -83,6 +67,160 @@ async def execute_sql(request: ExecuteSqlRequest, ctx: Context) -> ExecuteSqlRes
         )
     )
 
+
+async def _fetch_database_and_validate_access(
+    request: ExecuteSqlRequest,
+    ctx: Context,
+    *,
+    db: Any,
+    Database: Any,
+    security_manager: Any,
+) -> tuple[Any | None, ExecuteSqlResponse | None]:
+    """
+    Fetch the database by ID and validate access.
+
+    Returns (database, error_response). Exactly one of the tuple items will be non-None.
+    """
+    with event_logger.log_context(action="mcp.execute_sql.db_validation"):
+        database = db.session.query(Database).filter_by(id=request.database_id).first()
+        if not database:
+            await ctx.warning("Database not found: database_id=%s" % request.database_id)
+            return None, ExecuteSqlResponse(
+                success=False,
+                error=(
+                    f"Database with ID {request.database_id} not found."
+                    " Use list_databases to get valid database IDs."
+                ),
+                error_type=SupersetErrorType.DATABASE_NOT_FOUND_ERROR.value,
+            )
+
+        if not security_manager.can_access_database(database):
+            await ctx.warning("Access denied to database: %s" % database.database_name)
+            return None, ExecuteSqlResponse(
+                success=False,
+                error=f"Access denied to database {database.database_name}",
+                error_type=SupersetErrorType.DATABASE_SECURITY_ACCESS_ERROR.value,
+            )
+
+    return database, None
+
+
+async def _precheck_destructive_ddl(
+    request: ExecuteSqlRequest,
+    ctx: Context,
+    *,
+    database: Any,
+) -> ExecuteSqlResponse | None:
+    """
+    Block destructive DDL (DROP, TRUNCATE, ALTER).
+
+    Fail-closed: if parsing fails, block the query rather than allowing potentially
+    destructive SQL to bypass the check.
+    """
+    # Render Jinja2 templates first so templated SQL can be parsed.
+    sql_preview = request.sql[:100] + "..." if len(request.sql) > 100 else request.sql
+
+    with event_logger.log_context(action="mcp.execute_sql.ddl_check"):
+        try:
+            sql_to_check = request.sql
+            if request.template_params:
+                from superset.jinja_context import get_template_processor
+
+                tp = get_template_processor(database=database)
+                sql_to_check = tp.process_template(request.sql, **request.template_params)
+
+            script = SQLScript(sql_to_check, database.db_engine_spec.engine)
+            if script.has_destructive():
+                await ctx.error("Destructive DDL blocked: sql_preview=%r" % sql_preview)
+                return ExecuteSqlResponse(
+                    success=False,
+                    error=(
+                        "Destructive DDL statements (DROP, TRUNCATE, ALTER) "
+                        "are not allowed through MCP. Use the Superset SQL "
+                        "Lab UI for administrative database operations."
+                    ),
+                    error_type=SupersetErrorType.DML_NOT_ALLOWED_ERROR.value,
+                )
+        except Exception as parse_err:
+            await ctx.error(
+                "DDL pre-check failed to parse SQL, blocking query: %s" % str(parse_err)
+            )
+            return ExecuteSqlResponse(
+                success=False,
+                error=(
+                    "SQL could not be parsed for security validation. "
+                    "Please check your SQL syntax and try again."
+                ),
+                error_type=SupersetErrorType.INVALID_SQL_ERROR.value,
+            )
+
+    return None
+
+
+def _build_query_options(request: ExecuteSqlRequest) -> QueryOptions:
+    cache_opts = CacheOptions(force_refresh=True) if request.force_refresh else None
+    return QueryOptions(
+        catalog=request.catalog,
+        schema=request.schema_name,
+        limit=request.limit,
+        timeout_seconds=request.timeout,
+        template_params=request.template_params,
+        dry_run=request.dry_run,
+        cache=cache_opts,
+    )
+
+
+def _execute_query(database: Any, request: ExecuteSqlRequest, options: QueryOptions) -> QueryResult:
+    with event_logger.log_context(action="mcp.execute_sql.query_execution"):
+        return database.execute(request.sql, options)
+
+
+async def _maybe_add_template_warning(
+    request: ExecuteSqlRequest,
+    ctx: Context,
+    *,
+    response: ExecuteSqlResponse,
+    is_feature_enabled: Any,
+) -> None:
+    # Surface a warning when template_params is supplied but Jinja
+    # rendering is disabled — otherwise the params are silently dropped.
+    if request.template_params and not is_feature_enabled("ENABLE_TEMPLATE_PROCESSING"):
+        response.template_warning = (
+            "template_params was supplied but Jinja2 rendering is "
+            "disabled on this Superset instance "
+            "(ENABLE_TEMPLATE_PROCESSING feature flag is off). "
+            "Template variables in the SQL were NOT substituted; "
+            "the query was executed with literal '{{ var }}' placeholders."
+        )
+        await ctx.warning("template_params supplied but ENABLE_TEMPLATE_PROCESSING is off")
+
+
+async def _log_finish(response: ExecuteSqlResponse, ctx: Context) -> None:
+    if response.success:
+        await ctx.info(
+            "SQL execution completed successfully: rows_returned=%s, execution_time=%s"
+            % (response.row_count, response.execution_time)
+        )
+    else:
+        await ctx.info(
+            "SQL execution failed: error=%s, error_type=%s"
+            % (response.error, response.error_type)
+        )
+
+
+@tool(
+    tags=["mutate"],
+    class_permission_name="SQLLab",
+    method_permission_name="execute_sql_query",
+    annotations=ToolAnnotations(
+        title="Execute SQL query",
+        readOnlyHint=False,
+        destructiveHint=True,
+    ),
+)
+async def execute_sql(request: ExecuteSqlRequest, ctx: Context) -> ExecuteSqlResponse:
+    """Execute SQL query against database using the unified Database.execute() API."""
+    await _log_start(request, ctx)
     logger.info("Executing SQL query on database ID: %s", request.database_id)
 
     try:
@@ -90,135 +228,39 @@ async def execute_sql(request: ExecuteSqlRequest, ctx: Context) -> ExecuteSqlRes
         from superset import db, is_feature_enabled, security_manager
         from superset.models.core import Database
 
-        # 1. Get database and check access
-        with event_logger.log_context(action="mcp.execute_sql.db_validation"):
-            database = (
-                db.session.query(Database).filter_by(id=request.database_id).first()
-            )
-            if not database:
-                await ctx.warning(
-                    "Database not found: database_id=%s" % request.database_id
-                )
-                return ExecuteSqlResponse(
-                    success=False,
-                    error=(
-                        f"Database with ID {request.database_id} not found."
-                        " Use list_databases to get valid database IDs."
-                    ),
-                    error_type=SupersetErrorType.DATABASE_NOT_FOUND_ERROR.value,
-                )
-
-            if not security_manager.can_access_database(database):
-                await ctx.warning(
-                    "Access denied to database: %s" % database.database_name
-                )
-                return ExecuteSqlResponse(
-                    success=False,
-                    error=f"Access denied to database {database.database_name}",
-                    error_type=SupersetErrorType.DATABASE_SECURITY_ACCESS_ERROR.value,
-                )
-
-        # 2. Block destructive DDL (DROP, TRUNCATE, ALTER)
-        # Fail-closed: if parsing fails, block the query rather than
-        # allowing potentially destructive SQL to bypass the check.
-        # Render Jinja2 templates first so templated SQL can be parsed.
-        with event_logger.log_context(action="mcp.execute_sql.ddl_check"):
-            try:
-                sql_to_check = request.sql
-                if request.template_params:
-                    from superset.jinja_context import get_template_processor
-
-                    tp = get_template_processor(database=database)
-                    sql_to_check = tp.process_template(
-                        request.sql, **request.template_params
-                    )
-
-                script = SQLScript(sql_to_check, database.db_engine_spec.engine)
-                if script.has_destructive():
-                    await ctx.error(
-                        "Destructive DDL blocked: sql_preview=%r" % sql_preview
-                    )
-                    return ExecuteSqlResponse(
-                        success=False,
-                        error=(
-                            "Destructive DDL statements (DROP, TRUNCATE, ALTER) "
-                            "are not allowed through MCP. Use the Superset SQL "
-                            "Lab UI for administrative database operations."
-                        ),
-                        error_type=SupersetErrorType.DML_NOT_ALLOWED_ERROR.value,
-                    )
-            except Exception as parse_err:
-                await ctx.error(
-                    "DDL pre-check failed to parse SQL, blocking query: %s"
-                    % str(parse_err)
-                )
-                return ExecuteSqlResponse(
-                    success=False,
-                    error=(
-                        "SQL could not be parsed for security validation. "
-                        "Please check your SQL syntax and try again."
-                    ),
-                    error_type=SupersetErrorType.INVALID_SQL_ERROR.value,
-                )
-
-        # 3. Build QueryOptions and execute query
-        cache_opts = CacheOptions(force_refresh=True) if request.force_refresh else None
-        options = QueryOptions(
-            catalog=request.catalog,
-            schema=request.schema_name,
-            limit=request.limit,
-            timeout_seconds=request.timeout,
-            template_params=request.template_params,
-            dry_run=request.dry_run,
-            cache=cache_opts,
+        database, error_response = await _fetch_database_and_validate_access(
+            request,
+            ctx,
+            db=db,
+            Database=Database,
+            security_manager=security_manager,
         )
+        if error_response is not None:
+            return error_response
+        assert database is not None
 
-        # 4. Execute query
-        with event_logger.log_context(action="mcp.execute_sql.query_execution"):
-            result = database.execute(request.sql, options)
+        ddl_block = await _precheck_destructive_ddl(request, ctx, database=database)
+        if ddl_block is not None:
+            return ddl_block
 
-        # 5. Convert to MCP response format
+        options = _build_query_options(request)
+        result = _execute_query(database, request, options)
+
         with event_logger.log_context(action="mcp.execute_sql.response_conversion"):
             response = _convert_to_response(result)
 
-        # Surface a warning when template_params is supplied but Jinja
-        # rendering is disabled — otherwise the params are silently dropped.
-        if request.template_params and not is_feature_enabled(
-            "ENABLE_TEMPLATE_PROCESSING"
-        ):
-            response.template_warning = (
-                "template_params was supplied but Jinja2 rendering is "
-                "disabled on this Superset instance "
-                "(ENABLE_TEMPLATE_PROCESSING feature flag is off). "
-                "Template variables in the SQL were NOT substituted; "
-                "the query was executed with literal '{{ var }}' placeholders."
-            )
-            await ctx.warning(
-                "template_params supplied but ENABLE_TEMPLATE_PROCESSING is off"
-            )
-
-        # Log successful execution
-        if response.success:
-            await ctx.info(
-                "SQL execution completed successfully: rows_returned=%s, "
-                "execution_time=%s"
-                % (
-                    response.row_count,
-                    response.execution_time,
-                )
-            )
-        else:
-            await ctx.info(
-                "SQL execution failed: error=%s, error_type=%s"
-                % (response.error, response.error_type)
-            )
-
+        await _maybe_add_template_warning(
+            request,
+            ctx,
+            response=response,
+            is_feature_enabled=is_feature_enabled,
+        )
+        await _log_finish(response, ctx)
         return response
 
     except OAuth2RedirectError as ex:
         await ctx.warning(
-            "Database requires OAuth authentication: database_id=%s"
-            % request.database_id
+            "Database requires OAuth authentication: database_id=%s" % request.database_id
         )
         return ExecuteSqlResponse(
             success=False,
@@ -226,9 +268,7 @@ async def execute_sql(request: ExecuteSqlRequest, ctx: Context) -> ExecuteSqlRes
             error_type=SupersetErrorType.OAUTH2_REDIRECT.value,
         )
     except OAuth2Error:
-        await ctx.error(
-            "OAuth2 configuration/flow error: database_id=%s" % request.database_id
-        )
+        await ctx.error("OAuth2 configuration/flow error: database_id=%s" % request.database_id)
         return ExecuteSqlResponse(
             success=False,
             error=OAUTH2_CONFIG_ERROR_MESSAGE,
@@ -236,11 +276,7 @@ async def execute_sql(request: ExecuteSqlRequest, ctx: Context) -> ExecuteSqlRes
         )
     except Exception as e:
         await ctx.error(
-            "SQL execution failed: error=%s, database_id=%s"
-            % (
-                str(e),
-                request.database_id,
-            )
+            "SQL execution failed: error=%s, database_id=%s" % (str(e), request.database_id)
         )
         raise
 
@@ -280,9 +316,7 @@ def _data_to_statement_data(data: Any) -> StatementData:
         _sanitize_row_values(rows_data)
         return StatementData(
             rows=rows_data,
-            columns=[
-                ColumnInfo(name=col, type=str(data[col].dtype)) for col in data.columns
-            ],
+            columns=[ColumnInfo(name=col, type=str(data[col].dtype)) for col in data.columns],
         )
     elif isinstance(data, bytes):
         try:
