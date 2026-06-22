@@ -141,3 +141,5 @@ PROJECT.md
 oxc-custom-build/
 *.code-workspace
 *.duckdb
+.file_activity_report.json
+.knowledge.kavia

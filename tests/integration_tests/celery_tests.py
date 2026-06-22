@@ -117,10 +117,24 @@ def run_sql(
 
 def drop_table_if_exists(table_name: str, table_type: CTASMethod) -> None:
     """Drop table if it exists, works on any DB"""
-    sql = f"DROP {table_type.name} IF EXISTS {table_name}"
     database = get_example_database()
     with database.get_sqla_engine() as engine:
-        engine.execute(sql)
+        sql = f"DROP {table_type.name} IF EXISTS {table_name}"
+        try:
+            engine.execute(sql)
+        except Exception as ex:
+            # SQLite is strict about object types: dropping a VIEW with DROP TABLE
+            # (or vice-versa) raises an error even when using IF EXISTS.
+            if backend() != "sqlite":
+                raise
+
+            msg = str(ex)
+            if "use DROP VIEW to delete view" in msg:
+                engine.execute(f"DROP VIEW IF EXISTS {table_name}")
+            elif "use DROP TABLE to delete table" in msg:
+                engine.execute(f"DROP TABLE IF EXISTS {table_name}")
+            else:
+                raise
 
 
 def quote_f(value: Optional[str]):
@@ -166,43 +180,57 @@ def test_run_sync_query_dont_exist(test_client, ctas_method):
     examples_db = get_example_database()
     engine_name = examples_db.db_engine_spec.engine_name
     sql_dont_exist = "SELECT name FROM table_dont_exist"
-    result = run_sql(test_client, sql_dont_exist, cta=True, ctas_method=ctas_method)
-    if backend() == "sqlite" and ctas_method == CTASMethod.VIEW:
-        assert QueryStatus.SUCCESS == result["status"], result
-    elif backend() == "presto":
-        assert (
-            result["errors"][0]["error_type"]
-            == SupersetErrorType.TABLE_DOES_NOT_EXIST_ERROR
+    tmp_table_name = f"tmp_{ctas_method.name.lower()}"
+    # Ensure the tmp object name is free across parametrized runs (TABLE then VIEW).
+    drop_table_if_exists(tmp_table_name, CTASMethod.TABLE)
+    drop_table_if_exists(tmp_table_name, CTASMethod.VIEW)
+    try:
+        result = run_sql(
+            test_client,
+            sql_dont_exist,
+            cta=True,
+            ctas_method=ctas_method,
+            tmp_table=tmp_table_name,
         )
-        assert result["errors"][0]["level"] == ErrorLevel.ERROR
-        assert result["errors"][0]["extra"] == {
-            "engine_name": "Presto",
-            "issue_codes": [
-                {
-                    "code": 1003,
-                    "message": "Issue 1003 - There is a syntax error in the SQL query. Perhaps there was a misspelling or a typo.",  # noqa: E501
-                },
-                {
-                    "code": 1005,
-                    "message": "Issue 1005 - The table was deleted or renamed in the database.",  # noqa: E501
-                },
-            ],
-        }
-    else:
-        assert (
-            result["errors"][0]["error_type"]
-            == SupersetErrorType.GENERIC_DB_ENGINE_ERROR
-        )
-        assert result["errors"][0]["level"] == ErrorLevel.ERROR
-        assert result["errors"][0]["extra"] == {
-            "issue_codes": [
-                {
-                    "code": 1002,
-                    "message": "Issue 1002 - The database returned an unexpected error.",  # noqa: E501
-                }
-            ],
-            "engine_name": engine_name,
-        }
+        if backend() == "sqlite" and ctas_method == CTASMethod.VIEW:
+            assert QueryStatus.SUCCESS == result["status"], result
+        elif backend() == "presto":
+            assert (
+                result["errors"][0]["error_type"]
+                == SupersetErrorType.TABLE_DOES_NOT_EXIST_ERROR
+            )
+            assert result["errors"][0]["level"] == ErrorLevel.ERROR
+            assert result["errors"][0]["extra"] == {
+                "engine_name": "Presto",
+                "issue_codes": [
+                    {
+                        "code": 1003,
+                        "message": "Issue 1003 - There is a syntax error in the SQL query. Perhaps there was a misspelling or a typo.",  # noqa: E501
+                    },
+                    {
+                        "code": 1005,
+                        "message": "Issue 1005 - The table was deleted or renamed in the database.",  # noqa: E501
+                    },
+                ],
+            }
+        else:
+            assert (
+                result["errors"][0]["error_type"]
+                == SupersetErrorType.GENERIC_DB_ENGINE_ERROR
+            )
+            assert result["errors"][0]["level"] == ErrorLevel.ERROR
+            assert result["errors"][0]["extra"] == {
+                "issue_codes": [
+                    {
+                        "code": 1002,
+                        "message": "Issue 1002 - The database returned an unexpected error.",  # noqa: E501
+                    }
+                ],
+                "engine_name": engine_name,
+            }
+    finally:
+        drop_table_if_exists(tmp_table_name, CTASMethod.TABLE)
+        drop_table_if_exists(tmp_table_name, CTASMethod.VIEW)
 
 
 @pytest.mark.usefixtures("load_birth_names_data", "login_as_admin")

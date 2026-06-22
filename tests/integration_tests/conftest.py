@@ -42,6 +42,127 @@ if TYPE_CHECKING:
 CTAS_SCHEMA_NAME = "sqllab_test_db"
 ADMIN_SCHEMA_NAME = "admin_database"
 
+def _ensure_example_database_access(sm: Any) -> Any:
+    """
+    Ensure the example DB exists and return the permission-view used by test roles.
+    """
+    examples_db = get_example_database()
+    return sm.add_permission_view_menu("database_access", examples_db.perm)
+
+
+def _ensure_gamma_variant_roles(sm: Any, examples_pv: Any) -> None:
+    """
+    Create/ensure the special gamma_* roles and attach permissions, mirroring
+    `superset/cli/test.py::load_test_users`.
+    """
+    gamma_sqllab_role = sm.find_role("gamma_sqllab") or sm.add_role("gamma_sqllab")
+    sm.add_permission_role(gamma_sqllab_role, examples_pv)
+
+    gamma_no_csv_role = sm.find_role("gamma_no_csv") or sm.add_role("gamma_no_csv")
+    sm.add_permission_role(gamma_no_csv_role, examples_pv)
+
+    for role_name in ["Gamma", "sql_lab"]:
+        base_role = sm.find_role(role_name)
+        if not base_role:
+            # Defensive: in unexpected configurations, don't hard-fail seeding.
+            continue
+        for perm in base_role.permissions:
+            sm.add_permission_role(gamma_sqllab_role, perm)
+            if str(perm) != "can csv on Superset":
+                sm.add_permission_role(gamma_no_csv_role, perm)
+
+
+def _ensure_openapi_access(sm: Any) -> None:
+    """
+    Ensure the FAB OpenAPI spec endpoint permission exists and is granted to Admin.
+
+    Some integration tests expect `/api/v1/_openapi` to be accessible to the admin
+    test user, which requires `can_get` on the `OpenApi` view-menu.
+    """
+    openapi_pvm = sm.add_permission_view_menu("can_get", "OpenApi")
+    admin_role = sm.find_role("Admin")
+    if admin_role:
+        sm.add_permission_role(admin_role, openapi_pvm)
+
+
+def _ensure_sqllab_execute_access(sm: Any) -> None:
+    """
+    Ensure the SQL Lab execute endpoint permission exists and is granted to Admin.
+
+    Some integration tests call `/api/v1/sqllab/execute/` as the admin test user.
+    In certain CI setups the permission-view-menu `can_execute_sql_query` on `SQLLab`
+    may be missing from the metadata DB, causing a 403 response and downstream test
+    failures (tests expect a JSON payload with an `errors` field).
+    """
+    sqllab_execute_pvm = sm.add_permission_view_menu("can_execute_sql_query", "SQLLab")
+    for role_name in ("Admin", "sql_lab"):
+        role = sm.find_role(role_name)
+        if role:
+            sm.add_permission_role(role, sqllab_execute_pvm)
+
+
+def _seed_users(sm: Any) -> None:
+    """
+    Seed canonical integration-test users if missing.
+
+    Note: We intentionally do NOT attempt to reset/rewrite user IDs in a reused
+    SQLite DB, since that can violate FK constraints (e.g., tables referencing
+    `ab_user`).
+    """
+    users_to_seed = (
+        ("admin", "Admin"),
+        ("gamma", "Gamma"),
+        ("gamma2", "Gamma"),
+        ("gamma_sqllab", "gamma_sqllab"),
+        ("alpha", "Alpha"),
+        ("gamma_no_csv", "gamma_no_csv"),
+    )
+    for username, role_name in users_to_seed:
+        if sm.find_user(username=username):
+            continue
+        sm.add_user(
+            username,
+            username,
+            "user",
+            f"{username}@fab.org",
+            sm.find_role(role_name),
+            password="general",  # noqa: S106
+        )
+
+
+def _seed_standard_test_users() -> None:
+    """
+    Seed the standard set of users/roles expected by integration tests.
+
+    A number of integration tests assume the presence of the canonical
+    test users (admin/alpha/gamma/...) as created by the
+    `superset load-test-users` CLI command (see `superset/cli/test.py`).
+
+    In some CI environments the metadata DB is created without those users,
+    causing `security_manager.find_user("alpha")` to return None and tests
+    like `tests/integration_tests/access_tests.py::test_get_user_id` to fail.
+
+    This is intentionally implemented as test-only bootstrap to avoid
+    changing runtime behavior of Superset itself.
+    """
+    sm = security_manager
+
+    # Ensure the example DB exists; the CLI seeding logic attaches database
+    # access permissions to roles using the example DB perm string.
+    examples_pv = _ensure_example_database_access(sm)
+
+    # Ensure built-in roles/permissions exist.
+    sm.sync_role_definitions()
+
+    # Create/ensure the special "gamma_*" roles and attach permissions, mirroring
+    # `superset/cli/test.py::load_test_users`.
+    _ensure_openapi_access(sm)
+    _ensure_sqllab_execute_access(sm)
+    _ensure_gamma_variant_roles(sm, examples_pv)
+    _seed_users(sm)
+
+    db.session.commit()
+
 
 @pytest.fixture
 def app_context():
@@ -122,6 +243,9 @@ def setup_sample_data() -> Any:
     # relying on `tests.integration_tests.test_app.app` leveraging an `app` fixture
     # which is purposely scoped to the function level to ensure tests remain idempotent.
     with app.app_context():
+        # Ensure canonical test users exist for integration tests which rely on them.
+        _seed_standard_test_users()
+
         try:
             setup_presto_if_needed()
         except Exception:  # noqa: S110
