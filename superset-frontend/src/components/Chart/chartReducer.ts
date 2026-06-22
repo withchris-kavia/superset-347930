@@ -58,12 +58,16 @@ export default function chartReducer(
       };
     },
     [actions.CHART_UPDATE_SUCCEEDED](state) {
+      if (action.queryController && action.queryController !== state.queryController) {
+        return state;
+      }
       return {
         ...state,
         chartStatus: 'success',
         chartAlert: null,
         queriesResponse: action.queriesResponse,
         chartUpdateEndTime: now(),
+        queryController: null,
       };
     },
     [actions.CHART_UPDATE_STARTED](state) {
@@ -78,11 +82,7 @@ export default function chartReducer(
       };
     },
     [actions.CHART_UPDATE_STOPPED](state) {
-      if (
-        action.queryController &&
-        state.queryController &&
-        action.queryController !== state.queryController
-      ) {
+      if (action.queryController && action.queryController !== state.queryController) {
         return state;
       }
       return {
@@ -108,6 +108,9 @@ export default function chartReducer(
       };
     },
     [actions.CHART_UPDATE_FAILED](state) {
+      if (action.queryController && action.queryController !== state.queryController) {
+        return state;
+      }
       return {
         ...state,
         chartStatus: 'failed',
@@ -119,6 +122,7 @@ export default function chartReducer(
         chartStackTrace: action.queriesResponse
           ? action.queriesResponse?.[0]?.stacktrace
           : null,
+        queryController: null,
       };
     },
     [actions.DYNAMIC_PLUGIN_CONTROLS_READY](state) {
@@ -152,6 +156,12 @@ export default function chartReducer(
       };
     },
     [actions.ANNOTATION_QUERY_SUCCESS](state) {
+      if (
+        action.queryController &&
+        action.queryController !== state.annotationQuery?.[action.annotation.name]
+      ) {
+        return state;
+      }
       const annotationData = {
         ...state.annotationData,
         [action.annotation.name]: action.queryResponse.data,
@@ -168,6 +178,12 @@ export default function chartReducer(
       };
     },
     [actions.ANNOTATION_QUERY_FAILED](state) {
+      if (
+        action.queryController &&
+        action.queryController !== state.annotationQuery?.[action.annotation.name]
+      ) {
+        return state;
+      }
       const annotationData = { ...state.annotationData };
       delete annotationData[action.annotation.name];
       const annotationError = {

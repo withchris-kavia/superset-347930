@@ -229,6 +229,33 @@ describe('chart actions', () => {
     }
   });
 
+  test('should pass the active query signal to async event waiting', async () => {
+    (
+      global as unknown as { featureFlags: Record<string, boolean> }
+    ).featureFlags = {
+      [FeatureFlag.GlobalAsyncQueries]: true,
+    };
+    const asyncEventPayload = {
+      status: 'pending',
+      result_url: null,
+      job_id: 'async-signal-test',
+      channel_id: '999',
+    };
+    const result = await actions.handleChartDataResponse(
+      { status: 202 } as Response,
+      {
+        result: asyncEventPayload as unknown as actions.ChartDataRequestResponse['json']['result'],
+      },
+      false,
+      { signal: new AbortController().signal },
+    );
+
+    expect(result).toEqual(asyncEventPayload);
+    expect(waitForAsyncDataStub).toHaveBeenCalledWith(asyncEventPayload, {
+      signal: expect.any(AbortSignal),
+    });
+  });
+
   test('should defer abort of previous controller to avoid Redux state mutation', async () => {
     jest.useFakeTimers();
     const chartKey = 'defer_abort_test';
