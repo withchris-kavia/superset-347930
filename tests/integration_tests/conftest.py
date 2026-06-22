@@ -85,6 +85,22 @@ def _ensure_openapi_access(sm: Any) -> None:
         sm.add_permission_role(admin_role, openapi_pvm)
 
 
+def _ensure_sqllab_execute_access(sm: Any) -> None:
+    """
+    Ensure the SQL Lab execute endpoint permission exists and is granted to Admin.
+
+    Some integration tests call `/api/v1/sqllab/execute/` as the admin test user.
+    In certain CI setups the permission-view-menu `can_execute_sql_query` on `SQLLab`
+    may be missing from the metadata DB, causing a 403 response and downstream test
+    failures (tests expect a JSON payload with an `errors` field).
+    """
+    sqllab_execute_pvm = sm.add_permission_view_menu("can_execute_sql_query", "SQLLab")
+    for role_name in ("Admin", "sql_lab"):
+        role = sm.find_role(role_name)
+        if role:
+            sm.add_permission_role(role, sqllab_execute_pvm)
+
+
 def _seed_users(sm: Any) -> None:
     """
     Seed canonical integration-test users if missing.
@@ -140,8 +156,9 @@ def _seed_standard_test_users() -> None:
 
     # Create/ensure the special "gamma_*" roles and attach permissions, mirroring
     # `superset/cli/test.py::load_test_users`.
-    _ensure_gamma_variant_roles(sm, examples_pv)
     _ensure_openapi_access(sm)
+    _ensure_sqllab_execute_access(sm)
+    _ensure_gamma_variant_roles(sm, examples_pv)
     _seed_users(sm)
 
     db.session.commit()

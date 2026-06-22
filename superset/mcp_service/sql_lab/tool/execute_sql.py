@@ -26,8 +26,9 @@ import logging
 from decimal import Decimal
 from typing import Any
 
-from fastmcp import Context
 import pandas as pd
+from fastmcp import Context
+
 from superset_core.mcp.decorators import ToolAnnotations, tool
 from superset_core.queries.types import (
     CacheOptions,
