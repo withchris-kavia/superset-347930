@@ -455,6 +455,46 @@ test('useListViewResource: ignores stale fetchData success from an older request
   expect(result.current.state.resourceCollection).toEqual(secondData);
 });
 
+test('useListViewResource: aborts the previous fetchData request when a newer request starts', () => {
+  const getSpy = jest.spyOn(SupersetClient, 'get').mockImplementation(
+    () =>
+      new Promise(() => {
+        // Keep requests pending so cancellation state can be inspected.
+      }) as Promise<JsonResponse>,
+  );
+
+  const { result } = renderHook(() =>
+    useListViewResource('chart', 'Charts', jest.fn(), false),
+  );
+
+  act(() => {
+    result.current.fetchData({
+      pageIndex: 0,
+      pageSize: 10,
+      sortBy: [{ id: 'name' }],
+      filters: [],
+    });
+  });
+
+  const firstSignal = (getSpy.mock.calls[0][0] as { signal?: AbortSignal })
+    .signal;
+  expect(firstSignal?.aborted).toBe(false);
+
+  act(() => {
+    result.current.fetchData({
+      pageIndex: 1,
+      pageSize: 10,
+      sortBy: [{ id: 'name' }],
+      filters: [],
+    });
+  });
+
+  const secondSignal = (getSpy.mock.calls[1][0] as { signal?: AbortSignal })
+    .signal;
+  expect(firstSignal?.aborted).toBe(true);
+  expect(secondSignal?.aborted).toBe(false);
+});
+
 test('useListViewResource: ignores stale fetchData errors from an older request', async () => {
   let rejectFirst: ((value: unknown) => void) | undefined;
   let resolveSecond: ((value: unknown) => void) | undefined;
@@ -729,6 +769,91 @@ test('useSingleViewResource: ignores stale fetchResource success from an older r
     resolveFirst?.({ json: { result: { id: 1, name: 'stale' } } });
   });
 
+  expect(result.current.state.resource).toEqual({
+    id: 2,
+    name: 'current',
+  });
+});
+
+test('useSingleViewResource: aborts the previous fetchResource request when a newer request starts', () => {
+  const getSpy = jest.spyOn(SupersetClient, 'get').mockImplementation(
+    () =>
+      new Promise(() => {
+        // Keep requests pending so cancellation state can be inspected.
+      }) as Promise<JsonResponse>,
+  );
+
+  const { result } = renderHook(() =>
+    useSingleViewResource('chart', 'Charts', jest.fn()),
+  );
+
+  act(() => {
+    result.current.fetchResource(1);
+  });
+
+  const firstSignal = (getSpy.mock.calls[0][0] as { signal?: AbortSignal })
+    .signal;
+  expect(firstSignal?.aborted).toBe(false);
+
+  act(() => {
+    result.current.fetchResource(2);
+  });
+
+  const secondSignal = (getSpy.mock.calls[1][0] as { signal?: AbortSignal })
+    .signal;
+  expect(firstSignal?.aborted).toBe(true);
+  expect(secondSignal?.aborted).toBe(false);
+});
+
+test('useSingleViewResource: ignores stale fetchResource errors from an older request', async () => {
+  let rejectFirst: ((value: unknown) => void) | undefined;
+  let resolveSecond: ((value: unknown) => void) | undefined;
+  const handleErrorMsg = jest.fn();
+
+  jest
+    .spyOn(SupersetClient, 'get')
+    .mockImplementationOnce(
+      () =>
+        new Promise((_, reject) => {
+          rejectFirst = reject;
+        }) as Promise<JsonResponse>,
+    )
+    .mockImplementationOnce(
+      () =>
+        new Promise(resolve => {
+          resolveSecond = resolve;
+        }) as Promise<JsonResponse>,
+    );
+
+  const { result } = renderHook(() =>
+    useSingleViewResource('chart', 'Charts', handleErrorMsg),
+  );
+
+  act(() => {
+    result.current.fetchResource(1);
+  });
+  act(() => {
+    result.current.fetchResource(2);
+  });
+
+  await act(async () => {
+    resolveSecond?.({ json: { result: { id: 2, name: 'current' } } });
+  });
+
+  await waitFor(() => {
+    expect(result.current.state.resource).toEqual({
+      id: 2,
+      name: 'current',
+    });
+    expect(result.current.state.loading).toBe(false);
+  });
+
+  await act(async () => {
+    rejectFirst?.(new Error('stale failure'));
+  });
+
+  expect(handleErrorMsg).not.toHaveBeenCalled();
+  expect(result.current.state.error).toBeNull();
   expect(result.current.state.resource).toEqual({
     id: 2,
     name: 'current',

@@ -229,6 +229,67 @@ describe('chart actions', () => {
     }
   });
 
+  test('should drop stale failure dispatches when a newer controller has replaced ours in state', async () => {
+    const chartKey = 'stale_failure_test';
+    const formData: Partial<QueryFormData> = {
+      slice_id: 789,
+      datasource: 'table__1',
+      viz_type: 'table',
+    };
+    const newerController = new AbortController();
+    const state: MockState = {
+      charts: {
+        [chartKey]: {
+          queryController: newerController,
+        },
+      },
+      common: {
+        conf: {
+          SUPERSET_WEBSERVER_TIMEOUT: 60,
+        },
+      },
+    };
+    const getState = jest.fn(() => state);
+    const dispatchMock = jest.fn();
+    const getChartDataRequestSpy = jest
+      .spyOn(actions, 'getChartDataRequest')
+      .mockRejectedValue(new Error('stale failure'));
+    const updateDataMaskSpy = jest
+      .spyOn(dataMaskActions, 'updateDataMask')
+      .mockReturnValue({ type: 'UPDATE_DATA_MASK' } as ReturnType<
+        typeof dataMaskActions.updateDataMask
+      >);
+    const getQuerySettingsStub = jest
+      .spyOn(exploreUtils, 'getQuerySettings')
+      .mockReturnValue([false, () => {}] as unknown as ReturnType<
+        typeof exploreUtils.getQuerySettings
+      >);
+
+    try {
+      const thunkAction = actions.exploreJSON(
+        formData as QueryFormData,
+        false,
+        undefined,
+        chartKey,
+      );
+      await thunkAction(
+        dispatchMock as unknown as actions.ChartThunkDispatch,
+        getState as unknown as () => actions.RootState,
+        undefined,
+      );
+
+      const dispatchedTypes = dispatchMock.mock.calls.map(
+        ([action]) => action?.type,
+      );
+      expect(dispatchedTypes).toContain(actions.CHART_UPDATE_STARTED);
+      expect(dispatchedTypes).not.toContain(actions.CHART_UPDATE_FAILED);
+    } finally {
+      getChartDataRequestSpy.mockRestore();
+      updateDataMaskSpy.mockRestore();
+      getQuerySettingsStub.mockRestore();
+    }
+  });
+
   test('should pass the active query signal to async event waiting', async () => {
     (
       global as unknown as { featureFlags: Record<string, boolean> }

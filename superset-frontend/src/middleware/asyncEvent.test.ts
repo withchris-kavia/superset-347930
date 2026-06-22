@@ -184,6 +184,25 @@ describe('asyncEvent middleware', () => {
       await expect(promise).rejects.toMatchObject({ name: 'AbortError' });
     });
 
+    test('aborted waiter releases its job listener so a later waiter receives the event', async () => {
+      const controller = new AbortController();
+      const firstPromise = asyncEvent.waitForAsyncData(asyncPendingEvent, {
+        signal: controller.signal,
+      });
+
+      controller.abort();
+
+      await expect(firstPromise).rejects.toMatchObject({ name: 'AbortError' });
+
+      fetchMock.clearHistory();
+
+      const secondPromise = asyncEvent.waitForAsyncData(asyncPendingEvent);
+      await asyncEvent.processEvents([asyncDoneEvent]);
+
+      await expect(secondPromise).resolves.toEqual([chartData]);
+      expect(fetchMock.callHistory.calls(CACHED_DATA_ENDPOINT)).toHaveLength(1);
+    });
+
     // Regression guard for the motivating CodeQL case: a job_id that collides
     // with a built-in Object property (e.g. "__proto__"/"constructor") must be
     // routed through the Map-based registries without triggering prototype
