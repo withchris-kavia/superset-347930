@@ -78,12 +78,16 @@ function UIFilters(
   // On cold load, URL params restore values but not labels for fetchSelects filters.
   // Fetch the first page of options and cache the matching label so the tooltip works.
   useEffect(() => {
+    let cancelled = false;
     filters.forEach((filter, index) => {
       if (filter.input !== 'select' || !filter.fetchSelects) return;
       if (tooltipLabels[index]) return;
       const val = internalFilters?.[index]?.value as SelectOption | undefined;
       if (!val?.value) return;
       filter.fetchSelects('', 0, 500).then(result => {
+        if (cancelled) {
+          return;
+        }
         const match = result?.data?.find(
           (s: SelectOption) => s.value === val.value,
         );
@@ -96,8 +100,10 @@ function UIFilters(
         }
       });
     });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [internalFilters]);
+    return () => {
+      cancelled = true;
+    };
+  }, [filters, internalFilters, tooltipLabels]);
 
   // Build datetime_range tooltips from the resolved [start, end] array value.
   // Handles both ISO strings and unix-ms numbers.

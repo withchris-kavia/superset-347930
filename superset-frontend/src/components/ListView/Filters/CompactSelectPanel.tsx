@@ -150,6 +150,7 @@ function CompactSelectPanel(
   const [debouncedSearch, setDebouncedSearch] = useState('');
   const [remoteOptions, setRemoteOptions] = useState<SelectOption[]>([]);
   const [internalLoading, setInternalLoading] = useState(false);
+  const latestOptionsRequestIdRef = useRef(0);
 
   const isLoading = externalLoading || internalLoading;
 
@@ -184,20 +185,32 @@ function CompactSelectPanel(
   // Fetch remote options when debounced search changes
   useEffect(() => {
     if (!fetchSelects) return;
-    let cancelled = false;
+    const requestId = latestOptionsRequestIdRef.current + 1;
+    latestOptionsRequestIdRef.current = requestId;
+    const isCurrentRequest = () =>
+      latestOptionsRequestIdRef.current === requestId;
+
     setInternalLoading(true);
     fetchSelects(debouncedSearch, 0, ASYNC_PAGE_SIZE)
       .then(result => {
-        if (!cancelled) setRemoteOptions(result?.data ?? []);
+        if (isCurrentRequest()) {
+          setRemoteOptions(result?.data ?? []);
+        }
       })
       .catch(() => {
-        if (!cancelled) setRemoteOptions([]);
+        if (isCurrentRequest()) {
+          setRemoteOptions([]);
+        }
       })
       .finally(() => {
-        if (!cancelled) setInternalLoading(false);
+        if (isCurrentRequest()) {
+          setInternalLoading(false);
+        }
       });
     return () => {
-      cancelled = true;
+      if (latestOptionsRequestIdRef.current === requestId) {
+        latestOptionsRequestIdRef.current += 1;
+      }
     };
   }, [debouncedSearch, fetchSelects]);
 
