@@ -42,76 +42,19 @@ if TYPE_CHECKING:
 CTAS_SCHEMA_NAME = "sqllab_test_db"
 ADMIN_SCHEMA_NAME = "admin_database"
 
-def _seed_standard_test_users() -> None:
+def _ensure_example_database_access(sm: Any) -> Any:
     """
-    Seed the standard set of users/roles expected by integration tests.
-
-    A number of integration tests assume the presence of the canonical
-    test users (admin/alpha/gamma/...) as created by the
-    `superset load-test-users` CLI command (see `superset/cli/test.py`).
-
-    In some CI environments the metadata DB is created without those users,
-    causing `security_manager.find_user("alpha")` to return None and tests
-    like `tests/integration_tests/access_tests.py::test_get_user_id` to fail.
-
-    This is intentionally implemented as test-only bootstrap to avoid
-    changing runtime behavior of Superset itself.
+    Ensure the example DB exists and return the permission-view used by test roles.
     """
-
-    from superset.utils.database import get_example_database
-
-    sm = security_manager
-
-    def _reset_users_for_deterministic_ids() -> None:
-        """
-        Reset FAB users so canonical integration-test users get stable IDs.
-
-        Some integration tests assert hard-coded IDs (e.g. gamma=2, alpha=5).
-        When a metadata DB is reused, IDs can drift. We reset the user tables
-        (and restart identity where possible) to restore deterministic IDs.
-        """
-        from sqlalchemy import text
-
-        dialect = db.engine.dialect.name
-        if dialect == "postgresql":
-            db.session.execute(
-                text(
-                    "TRUNCATE TABLE ab_user_role, ab_user RESTART IDENTITY CASCADE"
-                )
-            )
-        else:
-            db.session.execute(text("DELETE FROM ab_user_role"))
-            db.session.execute(text("DELETE FROM ab_user"))
-            if dialect == "sqlite":
-                db.session.execute(
-                    text("DELETE FROM sqlite_sequence WHERE name='ab_user'")
-                )
-        db.session.commit()
-
-    # If DB is reused, ensure expected IDs for core users:
-    # admin=1, gamma=2, alpha=5.
-    user_count = db.session.query(sm.user_model).count()
-    if user_count:
-        existing = {
-            u.username: u.id
-            for u in db.session.query(sm.user_model)
-            .filter(sm.user_model.username.in_(["admin", "gamma", "alpha"]))
-            .all()
-        }
-        expected = {"admin": 1, "gamma": 2, "alpha": 5}
-        if any(existing.get(name) not in (None, exp) for name, exp in expected.items()):
-            _reset_users_for_deterministic_ids()
-
-    # Ensure the example DB exists; the CLI seeding logic attaches database
-    # access permissions to roles using the example DB perm string.
     examples_db = get_example_database()
-    examples_pv = sm.add_permission_view_menu("database_access", examples_db.perm)
+    return sm.add_permission_view_menu("database_access", examples_db.perm)
 
-    # Ensure built-in roles/permissions exist.
-    sm.sync_role_definitions()
 
-    # Create/ensure the special "gamma_*" roles and attach permissions, mirroring
-    # `superset/cli/test.py::load_test_users`.
+def _ensure_gamma_variant_roles(sm: Any, examples_pv: Any) -> None:
+    """
+    Create/ensure the special gamma_* roles and attach permissions, mirroring
+    `superset/cli/test.py::load_test_users`.
+    """
     gamma_sqllab_role = sm.find_role("gamma_sqllab") or sm.add_role("gamma_sqllab")
     sm.add_permission_role(gamma_sqllab_role, examples_pv)
 
@@ -128,8 +71,15 @@ def _seed_standard_test_users() -> None:
             if str(perm) != "can csv on Superset":
                 sm.add_permission_role(gamma_no_csv_role, perm)
 
-    # Create users in a deterministic order so integration tests that rely on
-    # stable IDs (e.g. gamma=2, alpha=5) continue to work in fresh databases.
+
+def _seed_users(sm: Any) -> None:
+    """
+    Seed canonical integration-test users if missing.
+
+    Note: We intentionally do NOT attempt to reset/rewrite user IDs in a reused
+    SQLite DB, since that can violate FK constraints (e.g., tables referencing
+    `ab_user`).
+    """
     users_to_seed = (
         ("admin", "Admin"),
         ("gamma", "Gamma"),
@@ -149,6 +99,36 @@ def _seed_standard_test_users() -> None:
             sm.find_role(role_name),
             password="general",  # noqa: S106
         )
+
+
+def _seed_standard_test_users() -> None:
+    """
+    Seed the standard set of users/roles expected by integration tests.
+
+    A number of integration tests assume the presence of the canonical
+    test users (admin/alpha/gamma/...) as created by the
+    `superset load-test-users` CLI command (see `superset/cli/test.py`).
+
+    In some CI environments the metadata DB is created without those users,
+    causing `security_manager.find_user("alpha")` to return None and tests
+    like `tests/integration_tests/access_tests.py::test_get_user_id` to fail.
+
+    This is intentionally implemented as test-only bootstrap to avoid
+    changing runtime behavior of Superset itself.
+    """
+    sm = security_manager
+
+    # Ensure the example DB exists; the CLI seeding logic attaches database
+    # access permissions to roles using the example DB perm string.
+    examples_pv = _ensure_example_database_access(sm)
+
+    # Ensure built-in roles/permissions exist.
+    sm.sync_role_definitions()
+
+    # Create/ensure the special "gamma_*" roles and attach permissions, mirroring
+    # `superset/cli/test.py::load_test_users`.
+    _ensure_gamma_variant_roles(sm, examples_pv)
+    _seed_users(sm)
 
     db.session.commit()
 

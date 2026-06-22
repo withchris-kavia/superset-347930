@@ -26,8 +26,8 @@ import logging
 from decimal import Decimal
 from typing import Any
 
-import pandas as pd
 from fastmcp import Context
+import pandas as pd
 from superset_core.mcp.decorators import ToolAnnotations, tool
 from superset_core.queries.types import (
     CacheOptions,
@@ -91,7 +91,9 @@ async def _fetch_database_and_validate_access(
             db.session.query(database_model).filter_by(id=request.database_id).first()
         )
         if not database:
-            await ctx.warning("Database not found: database_id=%s" % request.database_id)
+            await ctx.warning(
+                "Database not found: database_id=%s" % request.database_id
+            )
             return None, ExecuteSqlResponse(
                 success=False,
                 error=(

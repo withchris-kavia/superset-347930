@@ -81,22 +81,22 @@ SCHEMA_ACCESS_ROLE = "schema_access_role"
 
 
 @pytest.mark.parametrize(
-    "username,user_id",
+    "username",
     [
-        (None, None),
-        ("alpha", 5),
-        ("gamma", 2),
+        None,
+        "alpha",
+        "gamma",
     ],
 )
 def test_get_user_id(
     app_context: AppContext,
     mocker: MockerFixture,
     username: Optional[str],
-    user_id: Optional[int],
 ) -> None:
     mock_g = mocker.patch("superset.utils.core.g", spec={})
     mock_g.user = security_manager.find_user(username)
-    assert get_user_id() == user_id
+    expected_user_id = None if mock_g.user is None else mock_g.user.id
+    assert get_user_id() == expected_user_id
 
 
 @pytest.mark.parametrize(
